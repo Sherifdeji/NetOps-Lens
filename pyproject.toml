@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netops-lens"
+version = "0.1.0"
+description = "AI-powered network configuration change investigation (V1: read-only assessment + candidate verification)"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "pybatfish",
+    "pandas",
+    "streamlit",
+    "pydantic>=2,<3",
+    "pyyaml",
+    "python-dotenv",
+    "httpx",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "mypy",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = false
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F"]

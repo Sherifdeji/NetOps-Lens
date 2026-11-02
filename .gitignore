@@ -23,3 +23,6 @@ __pycache__/
 
 # Local application secrets
 .streamlit/secrets.toml
+
+# Ephemeral candidate verification copies
+runs/
