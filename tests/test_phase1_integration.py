@@ -64,10 +64,14 @@ def live(manifest, batfish_session) -> dict:
     """Connected client with every manifest snapshot initialized.
 
     Takes ``batfish_session`` purely as the skip-with-reason health gate.
+    Uses a unique run-scoped Batfish network; deleted at module teardown.
     """
+    import uuid
+
     del batfish_session
     settings = load_settings()
-    client = BatfishClient(settings.batfish_host, settings.batfish_network)
+    network = f"netops-lens-phase1-it-{uuid.uuid4().hex[:8]}"
+    client = BatfishClient(settings.batfish_host, network)
     client.connect()
     names: dict[str, str] = {}
     for entry in manifest["scenarios"].values():
@@ -76,7 +80,11 @@ def live(manifest, batfish_session) -> dict:
             if path not in names:
                 snap_name = path.strip("/").replace("/", "-")
                 names[path] = client.init_snapshot(REPO_ROOT / path, snap_name)
-    return {"client": client, "snapshots": names}
+    yield {"client": client, "snapshots": names}
+    try:
+        client.delete_network()
+    except Exception:
+        pass
 
 
 def _snap(live, scenario: str, role: str, manifest) -> str:

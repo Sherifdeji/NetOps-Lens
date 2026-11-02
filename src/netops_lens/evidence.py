@@ -94,7 +94,17 @@ def validate_finding(
 
 
 def _record_reachability(record: EvidenceRecord) -> str | None:
-    """Map a stored Batfish disposition to REACHABLE/UNREACHABLE (mirrors tools)."""
+    """Normalized reachability of a stored tool record.
+
+    N-01: prefer the tool-computed normalized result in details
+    ("reachability"), which survives unanimous trace sets whose raw
+    dispositions differ (e.g. DENIED_IN + DENIED_OUT, record disposition
+    None). Raw-disposition mapping is only a fallback for records that
+    predate the normalized field; it must never override it.
+    """
+    normalized = record.details.get("reachability")
+    if normalized in ("REACHABLE", "UNREACHABLE"):
+        return normalized
     disposition = record.disposition
     if disposition == "ACCEPTED":
         return "REACHABLE"
@@ -160,7 +170,14 @@ def _disposition_supports(
     if claim == "ROUTE_ABSENT":
         return any(
             r.tool == "get_routes"
-            and (r.details.get("tool_status") != "ok" or r.details.get("route_found") is False)
+            and r.details.get("tool_status") == "ok"
+            and r.details.get("route_found") is False
+            and type(r.details.get("route_count")) is int
+            and r.details.get("route_count") == 0
+            and r.details.get("routes") == []
+            and isinstance(r.details.get("node"), str)
+            and r.details.get("node") != ""
+            and "prefix" in r.details
             for r in records
         )
     if claim == "TRACE_DISPOSITION":

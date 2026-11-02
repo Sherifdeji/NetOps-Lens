@@ -5,17 +5,58 @@ from __future__ import annotations
 from netops_lens.batfish_client import BatfishClient, BatfishError, HealthRecords
 
 
-def trace_row(disposition: str, hops: list | None = None) -> dict:
+def flow_dict(
+    *,
+    src: str = "192.0.2.10",
+    dst: str = "198.51.100.1",
+    proto: str = "ICMP",
+    dport: int | None = None,
+    sport: int = 49152,
+    node: str = "r1",
+    iface: str = "GigabitEthernet0/1",
+) -> dict:
+    """Realistic Batfish Flow identity (synthetic values, observed shape).
+
+    Mirrors the keys Batfish actually returns (see
+    docs/phase23-differential-observation.md). ``sport`` is ephemeral and
+    must never participate in identity matching.
+    """
     return {
-        "Flow": "fake-flow",
+        "srcIp": src,
+        "dstIp": dst,
+        "ipProtocol": proto,
+        "dstPort": dport,
+        "srcPort": sport,
+        "ingressNode": node,
+        "ingressInterface": iface,
+    }
+
+
+def trace_row(
+    disposition: str, hops: list | None = None, flow: dict | None = None
+) -> dict:
+    return {
+        "Flow": flow if flow is not None else flow_dict(),
         "Traces": [{"disposition": disposition, "hops": hops if hops is not None else []}],
         "TraceCount": 1,
     }
 
 
-def differential_row(snapshot_disp: str, reference_disp: str) -> dict:
+def multi_trace_row(dispositions: list, flow: dict | None = None) -> dict:
+    """One traceroute row with several traces (synthetic adversarial case)."""
+    traces = [{"disposition": d, "hops": []} for d in dispositions]
     return {
-        "Flow": "fake-flow",
+        "Flow": flow if flow is not None else flow_dict(),
+        "Traces": traces,
+        "TraceCount": len(traces),
+    }
+
+
+def differential_row(
+    snapshot_disp: str, reference_disp: str, flow: dict | None = None
+) -> dict:
+    return {
+        "Flow": flow if flow is not None else flow_dict(),
         "Snapshot_Traces": [{"disposition": snapshot_disp, "hops": []}],
         "Snapshot_TraceCount": 1,
         "Reference_Traces": [{"disposition": reference_disp, "hops": []}],
@@ -28,6 +69,7 @@ def multi_differential_row(
     reference_disps: list,
     snapshot_total: int | None = None,
     reference_total: int | None = None,
+    flow: dict | None = None,
 ) -> dict:
     """One differential row with several traces per side.
 
@@ -35,7 +77,7 @@ def multi_differential_row(
     explicit totals to simulate truncation.
     """
     return {
-        "Flow": "fake-flow",
+        "Flow": flow if flow is not None else flow_dict(),
         "Snapshot_Traces": [{"disposition": d, "hops": []} for d in snapshot_disps],
         "Snapshot_TraceCount": (len(snapshot_disps) if snapshot_total is None else snapshot_total),
         "Reference_Traces": [{"disposition": d, "hops": []} for d in reference_disps],

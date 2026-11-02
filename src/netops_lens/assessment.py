@@ -236,6 +236,9 @@ def run_mandatory_assessment(
             ambiguous=diff_outcome.query_ok and not diff_outcome.conclusive,
             ambiguous_detail=diff_outcome.incomplete_reason,
         )
+        if not health_ok:
+            classification = "UNKNOWN"
+            discrepancy = None
         comparisons.append(
             FlowComparison(
                 flow_id=flow.flow_id,
@@ -246,7 +249,19 @@ def run_mandatory_assessment(
             )
         )
         flow_evidence = [base_result.evidence_id, prop_result.evidence_id]
-        if discrepancy is not None and base_reach != prop_reach:
+        if diff_outcome.out_of_scope:
+            inconclusive_reasons.append(
+                f"differential returned {len(diff_outcome.out_of_scope)} out-of-scope "
+                f"row(s) for flow '{flow.flow_id}'; ignored for corroboration "
+                f"(see {diff_result.evidence_id})"
+            )
+        if not health_ok:
+            inconclusive_reasons.append(
+                f"flow '{flow.flow_id}' ({kind}) untrusted: snapshot health NOT_OK"
+            )
+            continue
+        directs_known = "UNKNOWN" not in (base_reach, prop_reach)
+        if discrepancy is not None and directs_known and base_reach != prop_reach:
             add_finding(
                 claim_type=ClaimType.REACHABILITY_CHANGED,
                 flow_id=flow.flow_id,

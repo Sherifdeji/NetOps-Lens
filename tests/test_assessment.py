@@ -16,8 +16,15 @@ from netops_lens.assessment import (
     run_mandatory_assessment,
 )
 from netops_lens.evidence import EvidenceStore
-from netops_lens.models import FlowKind, Intent, Reachability, SnapshotRef
-from tests._fakes import FakeClient, differential_row, multi_differential_row, trace_row
+from netops_lens.models import ClaimType, FlowKind, Intent, Reachability, SnapshotRef
+from tests._fakes import (
+    FakeClient,
+    differential_row,
+    flow_dict,
+    multi_differential_row,
+    multi_trace_row,
+    trace_row,
+)
 
 BASE = SnapshotRef(name="base", path="lab/baseline")
 PROP = SnapshotRef(name="prop", path="lab/proposed")
@@ -312,10 +319,22 @@ def test_reconcile_accepted_to_noroute_needs_corroboration():
 
 
 def test_run_denied_family_row_preserves_no_change():
+    # F-01: each declared flow needs its own identity-matching rows; one
+    # shared row must not corroborate two different protocols.
+    tcp = {"proto": "TCP", "dport": 22}
     answers = {
-        ("traceroute", "base"): [trace_row("NO_ROUTE")],
-        ("traceroute", "prop"): [trace_row("DENIED_IN")],
-        ("differentialReachability", "prop"): [multi_differential_row(["DENIED_IN"], ["NO_ROUTE"])],
+        ("traceroute", "base"): [
+            trace_row("NO_ROUTE"),
+            trace_row("NO_ROUTE", flow=flow_dict(**tcp)),
+        ],
+        ("traceroute", "prop"): [
+            trace_row("NO_ROUTE"),
+            trace_row("DENIED_IN", flow=flow_dict(**tcp)),
+        ],
+        ("differentialReachability", "prop"): [
+            multi_differential_row(["NO_ROUTE"], ["NO_ROUTE"]),
+            multi_differential_row(["DENIED_IN"], ["NO_ROUTE"], flow=flow_dict(**tcp)),
+        ],
     }
     client = FakeClient(answers=answers)
     store = EvidenceStore()
@@ -354,3 +373,56 @@ def test_run_truncated_differential_surfaces_truncation_reason():
     assert result.flow_comparisons[0].classification == "UNKNOWN"
     assert result.verdict == "INCONCLUSIVE"
     assert any("truncation" in reason for reason in result.inconclusive_reasons)
+
+
+def _single_must_reach_intent() -> Intent:
+    return Intent(
+        version=1,
+        must_reach=[
+            {
+                "flow_id": "split-denied",
+                "src_ip": "192.0.2.10",
+                "dst_ip": "198.51.100.1",
+                "protocol": "ICMP",
+                "start_location": "@enter(r1[GigabitEthernet0/1])",
+            }
+        ],
+        must_not_reach=[],
+    )
+
+
+def test_split_denied_family_regression_end_to_end():
+    """N-01: baseline ACCEPTED, proposed two complete traces DENIED_IN +
+    DENIED_OUT. Proposed normalizes to UNREACHABLE, the differential
+    corroborates, Stage A completes, verdict is REGRESSION_DETECTED, and
+    every raw disposition stays visible in evidence."""
+    answers = {
+        ("traceroute", "base"): [trace_row("ACCEPTED")],
+        ("traceroute", "prop"): [multi_trace_row(["DENIED_IN", "DENIED_OUT"])],
+        ("differentialReachability", "prop"): [
+            multi_differential_row(["DENIED_IN", "DENIED_OUT"], ["ACCEPTED"])
+        ],
+    }
+    client = FakeClient(answers=answers)
+    store = EvidenceStore()
+    result = run_mandatory_assessment(client, store, BASE, PROP, _single_must_reach_intent())
+    assert result.verdict == "REGRESSION_DETECTED"
+    assert result.flow_comparisons[0].classification == "REGRESSION"
+    violated = [
+        f for f in result.findings if f.claim_type == ClaimType.INTENT_VIOLATED
+    ]
+    assert len(violated) == 1
+    raws: set[str] = set()
+    for evidence_id in violated[0].evidence_ids:
+        record = store.get(evidence_id)
+        assert record is not None
+        details = record.details
+        assert details.get("reachability") in ("REACHABLE", "UNREACHABLE")
+        raws.update(details.get("raw_dispositions", []))
+        if record.tool == "check_intent":
+            raws.update(
+                t.get("disposition")
+                for t in details.get("traces", [])
+                if isinstance(t, dict) and t.get("disposition")
+            )
+    assert {"ACCEPTED", "DENIED_IN", "DENIED_OUT"} <= raws

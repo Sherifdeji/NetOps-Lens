@@ -22,7 +22,7 @@ from netops_lens.tools import (
     get_snapshot_health,
     trace_flow,
 )
-from tests._fakes import FakeClient, multi_differential_row, raw_differential_row
+from tests._fakes import FakeClient, flow_dict, multi_differential_row, raw_differential_row
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 START = "@enter(r1[GigabitEthernet0/1])"
@@ -46,12 +46,20 @@ def _tcp_flow(port: int, flow_id: str = "f-tcp") -> FlowSpec:
 
 @pytest.fixture(scope="module")
 def live(batfish_session) -> dict:
-    """Connected client with every manifest snapshot initialized."""
+    """Connected client with every manifest snapshot initialized.
+
+    Uses a unique run-scoped Batfish network so concurrent runs or other
+    suites never overwrite these snapshots; the network is deleted at
+    module teardown.
+    """
+    import uuid
+
     del batfish_session
     settings = load_settings()
     from netops_lens.batfish_client import BatfishClient
 
-    client = BatfishClient(settings.batfish_host, settings.batfish_network)
+    network = f"netops-lens-tools-it-{uuid.uuid4().hex[:8]}"
+    client = BatfishClient(settings.batfish_host, network)
     client.connect()
     paths = [
         "lab/baseline",
@@ -63,7 +71,11 @@ def live(batfish_session) -> dict:
     names = {}
     for path in paths:
         names[path] = client.init_snapshot(REPO_ROOT / path, path.strip("/").replace("/", "-"))
-    return {"client": client, "snapshots": names}
+    yield {"client": client, "snapshots": names}
+    try:
+        client.delete_network()
+    except Exception:
+        pass
 
 
 def _ref(live, path: str) -> SnapshotRef:
@@ -353,19 +365,23 @@ def test_check_intent_empty_answer_is_inconclusive():
 
 
 def test_compare_multiple_consistent_traces_corroborates():
+    # N-02/N-04: two DISTINCT concrete flows (different ephemeral source
+    # ports), each complete against its OWN reported counts. No cross-row
+    # count sharing: row 1 reports 2/1, row 2 reports 1/2.
     answers = {
         ("differentialReachability", "prop"): [
             multi_differential_row(
                 ["NO_ROUTE", "NO_ROUTE"],
                 ["ACCEPTED"],
-                snapshot_total=3,
-                reference_total=2,
+                snapshot_total=2,
+                reference_total=1,
             ),
             multi_differential_row(
                 ["DENIED_IN"],
-                ["ACCEPTED"],
-                snapshot_total=3,
+                ["ACCEPTED", "ACCEPTED"],
+                snapshot_total=1,
                 reference_total=2,
+                flow=flow_dict(sport=50001),
             ),
         ]
     }
@@ -383,8 +399,12 @@ def test_compare_multiple_consistent_traces_corroborates():
     assert outcome.snapshot_reach == "UNREACHABLE"
     assert outcome.reference_reach == "REACHABLE"
     assert outcome.snapshot_trace_total == 3
-    assert outcome.reference_trace_total == 2
+    assert outcome.reference_trace_total == 3
     assert result.details["snapshot_trace_total"] == 3
+    assert result.details["distinct_instance_count"] == 2
+    # Distinct rows legitimately carry different totals: no single value.
+    assert outcome.snapshot_reported_total is None
+    assert outcome.reference_reported_total is None
 
 
 def test_compare_conflicting_traces_is_inconclusive():
@@ -514,23 +534,23 @@ def test_compare_conflicting_complete_traces_stays_inconclusive():
     assert result.status == "inconclusive"
     assert outcome.conclusive is False
     assert store.get(result.evidence_id).disposition == "AMBIGUOUS"
-    assert result.details["snapshot_complete"] is True
+    # N-02: per-side honesty — the conflicting snapshot side establishes
+    # nothing, while the unanimous reference side stays complete.
+    assert result.details["snapshot_complete"] is False
     assert result.details["reference_complete"] is True
 
 
 def test_compare_five_unanimous_of_twelve_is_inconclusive():
-    """Five unanimous returned traces prove nothing when twelve are reported."""
+    """Five unanimous returned traces prove nothing when twelve are reported.
+
+    N-02/N-04: a single concrete row returns 5 of 12 traces per side.
+    Completeness is judged against the row's own counts only.
+    """
     result, outcome, store = _compare(
         [
             multi_differential_row(
-                ["NO_ROUTE"] * 3,
-                ["ACCEPTED"] * 3,
-                snapshot_total=12,
-                reference_total=12,
-            ),
-            multi_differential_row(
-                ["NO_ROUTE"] * 2,
-                ["ACCEPTED"] * 2,
+                ["NO_ROUTE"] * 5,
+                ["ACCEPTED"] * 5,
                 snapshot_total=12,
                 reference_total=12,
             ),

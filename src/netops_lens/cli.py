@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import uuid
 from pathlib import Path
 from typing import NoReturn
 
@@ -128,6 +129,47 @@ def _print_human(report: Report, *, tag: str) -> None:
         print("Note: only tested flows are covered; untested traffic is not claimed safe.")
 
 
+def run_network_name(prefix: str, tag: str) -> str:
+    """Unique Batfish network for one assessment run.
+
+    N-03: the configured ``BATFISH_NETWORK`` value is the prefix, so runs
+    stay visibly grouped with the deployment they belong to. The tag and a
+    random suffix keep concurrent runs isolated from each other. Names stay
+    lowercase alphanumeric-plus-dash, and the suffix guarantees the name
+    can never equal the shared configured network itself.
+    """
+    def safe(text: str) -> str:
+        return "".join(c if c.isalnum() else "-" for c in text.lower())
+
+    return f"{safe(prefix)}-{safe(tag)}-{uuid.uuid4().hex[:8]}"
+
+
+def cleanup_run_network(client: BatfishClient, *, protected: str | None = None) -> bool:
+    """Best-effort deletion of a run-scoped network. Never raises.
+
+    The configured shared network is never deleted: when the client's
+    network equals ``protected``, cleanup is refused with a warning.
+    Cleanup failure never erases the final report or changes the exit code;
+    the caller owns both before calling this.
+    """
+    try:
+        network = client.network
+    except AttributeError:
+        network = None
+    if protected is not None and network == protected:
+        print(
+            f"warning: refusing to delete protected network {protected!r}",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        client.delete_network()
+    except BatfishError as exc:
+        print(f"warning: run network cleanup failed: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
 def run_assess(args: argparse.Namespace) -> int:
     try:
         settings = load_settings()
@@ -140,38 +182,57 @@ def run_assess(args: argparse.Namespace) -> int:
     except IntentError as exc:
         print(f"input error: {exc}", file=sys.stderr)
         return 1
-    client = BatfishClient(settings.batfish_host, settings.batfish_network)
-    try:
-        client.connect()
-    except BatfishError as exc:
-        print(f"Batfish unavailable: {exc}", file=sys.stderr)
-        return 1
+    client = BatfishClient(
+        settings.batfish_host, run_network_name(settings.batfish_network, tag)
+    )
     baseline_ref = SnapshotRef(name=f"{tag}-baseline", path=str(baseline_dir))
     proposed_ref = SnapshotRef(name=f"{tag}-proposed", path=str(proposed_dir))
+    exit_code = 1
     try:
-        client.init_snapshot(baseline_dir, baseline_ref.name)
-        client.init_snapshot(proposed_dir, proposed_ref.name)
-    except BatfishError as exc:
-        print(f"snapshot error: {exc}", file=sys.stderr)
-        return 1
-    store = EvidenceStore()
-    try:
-        assessment = run_mandatory_assessment(client, store, baseline_ref, proposed_ref, intent)
-        report = assemble_report(
-            assessment,
-            store,
-            expected_flow_ids=[f.flow_id for f in (*intent.must_reach, *intent.must_not_reach)],
+        try:
+            # N-03: connect lives inside the guarded region so even a
+            # partially failed setup attempts cleanup of this run's network.
+            client.connect()
+        except BatfishError as exc:
+            print(f"Batfish unavailable: {exc}", file=sys.stderr)
+            exit_code = 1
+            return exit_code
+        try:
+            client.init_snapshot(baseline_dir, baseline_ref.name)
+            client.init_snapshot(proposed_dir, proposed_ref.name)
+        except BatfishError as exc:
+            print(f"snapshot error: {exc}", file=sys.stderr)
+            exit_code = 1
+            return exit_code
+        store = EvidenceStore()
+        try:
+            assessment = run_mandatory_assessment(
+                client, store, baseline_ref, proposed_ref, intent
+            )
+            report = assemble_report(
+                assessment,
+                store,
+                expected_flow_ids=[
+                    f.flow_id for f in (*intent.must_reach, *intent.must_not_reach)
+                ],
+            )
+        except (AssessmentError, ReportError) as exc:
+            print(f"assessment error: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(report.model_dump_json(indent=2))
+        else:
+            _print_human(report, tag=tag)
+        if args.out:
+            Path(args.out).write_text(report.model_dump_json(indent=2) + "\n")
+        exit_code = (
+            0 if assessment.verdict in ("REGRESSION_DETECTED", "NO_REGRESSION_DETECTED") else 2
         )
-    except (AssessmentError, ReportError) as exc:
-        print(f"assessment error: {exc}", file=sys.stderr)
-        return 1
-    if args.json:
-        print(report.model_dump_json(indent=2))
-    else:
-        _print_human(report, tag=tag)
-    if args.out:
-        Path(args.out).write_text(report.model_dump_json(indent=2) + "\n")
-    return 0 if assessment.verdict in ("REGRESSION_DETECTED", "NO_REGRESSION_DETECTED") else 2
+    finally:
+        # The report is already printed; cleanup failure keeps the exit code.
+        # The protected argument is the shared network: it is never deleted.
+        cleanup_run_network(client, protected=settings.batfish_network)
+    return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:

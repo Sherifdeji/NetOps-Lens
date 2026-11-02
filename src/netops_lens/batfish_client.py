@@ -133,6 +133,27 @@ class BatfishClient:
             raise BatfishError("not connected: call connect() first")
         return self._session
 
+    def delete_network(self) -> None:
+        """Delete this client's Batfish network (cleanup after a run).
+
+        N-03: works even when ``connect()`` failed partway — a transient
+        session is opened so a partially created run network can still be
+        removed. A refusal or failure surfaces as BatfishError; callers
+        doing best-effort cleanup must catch it.
+        """
+        session = self._session
+        if session is None:
+            try:
+                session = Session(host=self._host)
+            except Exception as exc:
+                raise BatfishError(
+                    f"cannot reach Batfish at {self._host!r}: {type(exc).__name__}"
+                ) from exc
+        try:
+            session.delete_network(self._network)
+        except Exception as exc:
+            raise BatfishError(f"cannot delete network {self._network!r}: {exc}") from exc
+
     def init_snapshot(self, path: str | Path, name: str, *, overwrite: bool = True) -> str:
         """Load a snapshot directory into Batfish; returns the snapshot name."""
         session = self._require_session()
