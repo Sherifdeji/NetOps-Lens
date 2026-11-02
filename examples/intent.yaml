@@ -1,0 +1,9 @@
+version: 1
+description: App tier must reach the DB host
+must_reach:
+  - id: app-to-db-icmp
+    src: "192.0.2.10"
+    dst: "198.51.100.1"
+    protocol: ICMP
+    start_location: "@enter(r1[GigabitEthernet0/1])"
+must_not_reach: []

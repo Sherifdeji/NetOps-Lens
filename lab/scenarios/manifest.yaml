@@ -1,0 +1,18 @@
+# Machine-readable source of truth for V1 scenarios (see docs/implementation-plan.md §Fixture Mapping).
+# Tests and UI resolve scenario paths only through this file — never hard-coded pairs.
+scenarios:
+  healthy:
+    baseline_path: lab/baseline
+    proposed_path: lab/scenarios/healthy/proposed
+    intent_path: examples/intent.yaml
+    expected_verdict: NO_REGRESSION_DETECTED
+  removed_route:
+    baseline_path: lab/baseline
+    proposed_path: lab/proposed
+    intent_path: examples/intent.yaml
+    expected_verdict: REGRESSION_DETECTED
+  acl_blocks_db:
+    baseline_path: lab/scenarios/acl_blocks_db/baseline
+    proposed_path: lab/scenarios/acl_blocks_db/proposed
+    intent_path: examples/intent-acl.yaml
+    expected_verdict: REGRESSION_DETECTED

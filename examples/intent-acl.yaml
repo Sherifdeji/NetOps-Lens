@@ -1,0 +1,16 @@
+version: 1
+description: App may use the authorized DB service; App must not reach the unauthorized DB admin port
+must_reach:
+  - id: app-to-db-authorized
+    src: "192.0.2.10"
+    dst: "198.51.100.1"
+    protocol: TCP
+    dst_port: 1433
+    start_location: "@enter(r1[GigabitEthernet0/1])"
+must_not_reach:
+  - id: app-to-db-unauthorized
+    src: "192.0.2.10"
+    dst: "198.51.100.1"
+    protocol: TCP
+    dst_port: 22
+    start_location: "@enter(r1[GigabitEthernet0/1])"
