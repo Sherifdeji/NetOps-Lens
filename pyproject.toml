@@ -30,6 +30,12 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# F-07: ordinary runs execute only safe deterministic tests. Live
+# Meta API + Batfish integration runs explicitly with: pytest -m live
+addopts = ["-m", "not live"]
+markers = [
+    "live: live Meta API + Batfish integration (excluded from default runs)",
+]
 
 [tool.mypy]
 python_version = "3.14"

@@ -2,6 +2,11 @@
 
 Skipped with a reason when META_API_KEY is absent or Batfish is down.
 These exercise candidate collection only: nothing is applied or verified.
+
+Excluded from ordinary runs by the ``live`` marker (see pyproject).
+Explicit command for live integration runs::
+
+    python -m pytest -m live
 """
 
 from __future__ import annotations
@@ -21,6 +26,8 @@ from netops_lens.config import load_settings
 from netops_lens.evidence import EvidenceStore
 from netops_lens.intent import load_intent
 from netops_lens.agent import run_stage_b
+
+pytestmark = pytest.mark.live
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -120,6 +127,15 @@ def test_live_acl_investigation(batfish_session):
     assert "get_acl_rules" in tools
     assert investigation.candidates, f"model submitted no candidate: {_diag(investigation)}"
     ops = [op for c in investigation.candidates for op in c.operations]
+    # F-07: every candidate must target exactly the authorized DB flow.
+    for candidate in investigation.candidates:
+        assert candidate.target_flow_ids == ["app-to-db-authorized"], _diag(investigation)
+    # F-07: nothing may touch sequence 20 or open TCP/22.
+    for op in ops:
+        sequence = getattr(op, "sequence_number", None)
+        assert sequence != 20, f"sequence-20 modification: {_diag(investigation)}"
+        assert getattr(op, "dst_port", None) != 22, f"TCP/22 change: {_diag(investigation)}"
+    assert not any(op.op == "acl_deny" for op in ops), _diag(investigation)
     removes = [op for op in ops if op.op == "remove_acl_line"]
     permits = [op for op in ops if op.op == "acl_permit"]
     assert any(
@@ -131,9 +147,15 @@ def test_live_acl_investigation(batfish_session):
         for op in removes
     ), f"no evidenced seq-10 removal: {_diag(investigation)}"
     assert any(
-        op.node == "r1" and op.acl == "DB-FILTER" and op.sequence_number == 10
+        op.node == "r1"
+        and op.acl == "DB-FILTER"
+        and op.sequence_number == 10
+        and op.src == "192.0.2.0/24"
+        and op.dst == "198.51.100.0/24"
+        and op.protocol == "tcp"
+        and op.dst_port == 1433
         for op in permits
-    ), f"no seq-10 permit: {_diag(investigation)}"
+    ), f"no full seq-10 permit: {_diag(investigation)}"
 
 
 def test_live_healthy_explain_only(batfish_session):

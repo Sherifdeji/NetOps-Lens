@@ -16,6 +16,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from ipaddress import IPv4Address, IPv4Network
 from typing import Callable
 
 import httpx
@@ -25,6 +26,8 @@ from netops_lens import prompts
 from netops_lens.config import Settings, auth_headers, chat_completions_url, load_settings
 from netops_lens.evidence import EvidenceStore
 from netops_lens.models import (
+    AclAction,
+    AclPermit,
     AclRule,
     AddStaticRoute,
     AssessmentResult,
@@ -138,11 +141,15 @@ def submit_tool_spec() -> dict:
 
 
 def tools_for_verdict(verdict: str) -> list[dict]:
-    """Python-side tool registration. The model never widens this list."""
+    """Python-side tool registration. The model never widens this list.
+
+    F-05: only REGRESSION_DETECTED registers investigation and submission
+    tools. NO_REGRESSION_DETECTED and INCONCLUSIVE are explain-only: no
+    tools at all, so the model cannot investigate an untrusted snapshot
+    or reach any submission path.
+    """
     if verdict == "REGRESSION_DETECTED":
         return [*investigation_tool_specs(), submit_tool_spec()]
-    if verdict == "NO_REGRESSION_DETECTED":
-        return investigation_tool_specs()
     return []
 
 
@@ -151,8 +158,13 @@ def tools_for_verdict(verdict: str) -> list[dict]:
 Transport = Callable[[list[dict], list[dict]], dict]
 
 
-def default_transport(settings: Settings) -> Transport:
-    """OpenAI-compatible Chat Completions transport (Phase 0 observed shape)."""
+def default_transport(settings: Settings, http_client: httpx.Client | None = None) -> Transport:
+    """OpenAI-compatible Chat Completions transport (Phase 0 observed shape).
+
+    F-06: ``http_client`` is injectable so unit tests can drive the exact
+    same code path with a mocked httpx transport. Error messages carry
+    only the failure category, never response bodies or credentials.
+    """
     url = chat_completions_url(settings)
     headers = auth_headers(settings)
     model = settings.meta_model
@@ -162,32 +174,54 @@ def default_transport(settings: Settings) -> Transport:
         if tools:
             payload["tools"] = tools
         try:
-            with httpx.Client(timeout=TIMEOUT_S) as client:
-                resp = client.post(url, headers=headers, json=payload)
+            if http_client is not None:
+                resp = http_client.post(url, headers=headers, json=payload)
+            else:
+                with httpx.Client(timeout=TIMEOUT_S) as client:
+                    resp = client.post(url, headers=headers, json=payload)
         except httpx.TimeoutException as exc:
-            raise AgentError(f"transport_error: Meta API request timed out: {exc}") from exc
+            raise AgentError(
+                f"transport_error: timed out ({type(exc).__name__})"
+            ) from exc
         except httpx.HTTPError as exc:
-            raise AgentError(f"transport_error: Meta API unreachable: {exc}") from exc
+            raise AgentError(
+                f"transport_error: unreachable ({type(exc).__name__})"
+            ) from exc
         if resp.status_code in (401, 403):
             raise AgentError("transport_error: auth_error (401/403)")
         if resp.status_code != 200:
             raise AgentError(f"transport_error: unexpected_response http_{resp.status_code}")
         try:
-            message = resp.json()["choices"][0]["message"]
+            body = resp.json()
+            choice = body["choices"][0]
+            if not isinstance(choice, dict):
+                raise TypeError("choice is not an object")
+            message = choice["message"]
+            if not isinstance(message, dict):
+                raise TypeError("message is not an object")
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise AgentError("transport_error: malformed completion body") from exc
+        # R-1: finish_reason lives on choices[0] (a sibling of message),
+        # not inside the nested message. Only completed responses proceed;
+        # a missing value is accepted as before (the observed API always
+        # sends one), while any other unexpected value is incomplete.
+        finish = choice.get("finish_reason")
+        if finish not in (None, "stop", "tool_calls"):
+            raise AgentError(f"transport_error: incomplete response (finish_reason={finish!r})")
         calls = []
-        for item in message.get("tool_calls") or []:
+        tool_calls = message.get("tool_calls") or []
+        if not isinstance(tool_calls, list):
+            raise AgentError("transport_error: malformed tool call")
+        for item in tool_calls:
             try:
                 function = item["function"]
+                arguments = function.get("arguments") or "{}"
+                if not isinstance(arguments, str):
+                    raise TypeError("arguments is not a string")
                 calls.append(
-                    {
-                        "id": item["id"],
-                        "name": function["name"],
-                        "arguments": function.get("arguments") or "{}",
-                    }
+                    {"id": item["id"], "name": function["name"], "arguments": arguments}
                 )
-            except (KeyError, TypeError) as exc:
+            except (KeyError, TypeError, AttributeError) as exc:
                 raise AgentError("transport_error: malformed tool call") from exc
         content = message.get("content")
         return {
@@ -207,6 +241,11 @@ class _RunContext:
     proposed: SnapshotRef
     settings: Settings
     candidates: list[CandidatePatch] = field(default_factory=list)
+    # F-10: per-RUN (not per-candidate) count of failed submissions.
+    # MAX_PATCH_RETRIES therefore grants that many corrective retries per
+    # Stage B run: after the budget is spent every further submission is
+    # rejected, valid or not. Accepted-candidate capacity stays
+    # MAX_CANDIDATES per run.
     submission_failures: int = 0
     activity: list[ToolCallLog] = field(default_factory=list)
 
@@ -222,12 +261,19 @@ def _resolve_flow(ctx: _RunContext, flow_id: str) -> FlowSpec | None:
     return None
 
 
-def _route_rows_for(ctx: _RunContext, node: str) -> list[dict]:
-    """All get_routes route rows evidencing ``node`` in this run's store."""
+def _route_rows_for(ctx: _RunContext, node: str, snapshot_name: str) -> list[dict]:
+    """get_routes rows evidencing ``node`` on one snapshot in this run's store.
+
+    F-01: the snapshot identity (``EvidenceRecord.snapshots``) is part of
+    the lookup key. Baseline and proposed rows are never pooled, and rows
+    from unrelated runs never match.
+    """
     rows: list[dict] = []
     for evidence_id in ctx.store.ids():
         record = ctx.store.get(evidence_id)
         if record is None or record.tool != "get_routes":
+            continue
+        if snapshot_name not in record.snapshots:
             continue
         details = record.details
         if details.get("node") != node:
@@ -246,12 +292,20 @@ def _route_next_hop(row: dict) -> str | None:
     return next_hop if isinstance(next_hop, str) else None
 
 
-def _acl_rules_for(ctx: _RunContext, node: str, acl: str) -> list[dict]:
-    """All get_acl_rules rule entries evidencing ``node``/``acl`` this run."""
+def _acl_rules_for(ctx: _RunContext, node: str, acl: str, snapshot_name: str) -> list[dict]:
+    """get_acl_rules entries evidencing ``node``/``acl`` on one snapshot.
+
+    F-01: only records whose ``EvidenceRecord.snapshots`` include the
+    requested snapshot count. ``expected_rule`` matching always runs
+    against these same-snapshot rules; no hit from another snapshot is
+    ever treated as authoritative.
+    """
     rules: list[dict] = []
     for evidence_id in ctx.store.ids():
         record = ctx.store.get(evidence_id)
         if record is None or record.tool != "get_acl_rules":
+            continue
+        if snapshot_name not in record.snapshots:
             continue
         details = record.details
         if details.get("node") != node or details.get("acl") != acl:
@@ -262,48 +316,232 @@ def _acl_rules_for(ctx: _RunContext, node: str, acl: str) -> list[dict]:
     return rules
 
 
-def _check_route_support(ctx: _RunContext, *, node: str, prefix: str, next_hop: str) -> str | None:
-    """Evidence support for add/remove_static_route; None when supported."""
-    for row in _route_rows_for(ctx, node):
-        if row.get("Network") == prefix and _route_next_hop(row) == next_hop:
-            return None
-    return (
-        f"no get_routes evidence in this run shows {prefix} via {next_hop} "
-        f"on node {node!r}; static-route operations need tool evidence, "
-        "not general knowledge"
-    )
+def _prefix_covers_flow(prefix: str, flow: FlowSpec) -> bool:
+    """True when the candidate prefix carries the target flow's destination."""
+    try:
+        return IPv4Address(str(flow.dst_ip)) in IPv4Network(prefix, strict=False)
+    except ValueError:
+        return False
+
+
+def _endpoint_covers(rule_endpoint: str, ip: object) -> bool:
+    """True when an ACL endpoint value admits the flow's address."""
+    text = rule_endpoint.strip()
+    try:
+        address = IPv4Address(str(ip))
+    except ValueError:
+        return False
+    if text.lower() == "any":
+        return True
+    if text.lower().startswith("host "):
+        try:
+            return IPv4Address(text[5:].strip()) == address
+        except ValueError:
+            return False
+    try:
+        if "/" in text:
+            return address in IPv4Network(text, strict=False)
+        return IPv4Address(text) == address
+    except ValueError:
+        return False
+
+
+def _check_route_op(
+    ctx: _RunContext, op: AddStaticRoute | RemoveStaticRoute, targets: list[FlowSpec]
+) -> list[str]:
+    """Evidence + flow binding for one static-route operation.
+
+    F-01: add_static_route draws only on baseline-snapshot evidence,
+    remove_static_route only on proposed-snapshot evidence, matched by
+    exact node, prefix, and next hop on a static route row. F-03: the
+    prefix must additionally cover the destination of at least one
+    target flow; rows of other protocols or unrelated prefixes never
+    qualify merely because node and next hop match.
+    """
+    adding = isinstance(op, AddStaticRoute)
+    role = "baseline" if adding else "proposed"
+    snapshot_name = ctx.baseline.name if adding else ctx.proposed.name
+    rows = _route_rows_for(ctx, op.node, snapshot_name)
+    exact = [
+        row
+        for row in rows
+        if row.get("Network") == op.prefix
+        and _route_next_hop(row) == op.next_hop
+        and str(row.get("Protocol", "")).lower() == "static"
+    ]
+    if not exact:
+        return [
+            f"no {role} get_routes evidence in this run shows static route "
+            f"{op.prefix} via {op.next_hop} on node {op.node!r}; static-route "
+            "operations need same-snapshot tool evidence, not general knowledge"
+        ]
+    if not any(_prefix_covers_flow(op.prefix, flow) for flow in targets):
+        return [
+            f"prefix {op.prefix} covers the destination of no target flow; "
+            "bind the operation to a declared flow it can actually serve"
+        ]
+    return []
 
 
 def _check_acl_support(
     ctx: _RunContext, *, node: str, acl: str, sequence: int, expected: AclRule | None
 ) -> str | None:
-    """Evidence support for acl_permit/acl_deny/remove_acl_line.
+    """Evidence support for remove_acl_line (or a freed-sequence permit).
 
-    ``expected`` is the remove_acl_line expected_rule, or None for
-    permit/deny operations (the freed sequence itself is the evidence).
+    F-01: only proposed-snapshot ``get_acl_rules`` records count, matched
+    against any same-snapshot rule. ``expected`` is the remove_acl_line
+    expected_rule; for permit operations it is None (the sequence freed
+    by the same-candidate removal is the evidence).
     """
-    rules = _acl_rules_for(ctx, node, acl)
+    snapshot_name = ctx.proposed.name
+    rules = _acl_rules_for(ctx, node, acl, snapshot_name)
     if not rules:
         return (
-            f"no get_acl_rules evidence in this run for ACL {acl!r} on node "
-            f"{node!r}; call get_acl_rules before submitting ACL operations"
+            f"no proposed-snapshot get_acl_rules evidence in this run for ACL "
+            f"{acl!r} on node {node!r}; call get_acl_rules on the proposed "
+            "snapshot before submitting ACL operations"
         )
     hits = [r for r in rules if r.get("sequence_number") == sequence]
     if not hits:
         known = sorted(s for s in {r.get("sequence_number") for r in rules} if isinstance(s, int))
         return (
             f"sequence {sequence} is not evidenced for ACL {acl!r} on node "
-            f"{node!r} (evidenced sequences: {known}); never guess sequences"
+            f"{node!r} on the proposed snapshot (evidenced sequences: {known}); "
+            "never guess sequences"
         )
     if expected is not None:
         body = {k: hits[0].get(k) for k in ("action", "src", "dst", "protocol", "dst_port")}
         # Evidence details travel as JSON (enums already plain strings).
         if body != expected.model_dump(mode="json"):
             return (
-                f"expected_rule does not match the evidenced rule at sequence "
-                f"{sequence} ({body}); copy the get_acl_rules rule verbatim"
+                f"expected_rule does not match the evidenced proposed-snapshot "
+                f"rule at sequence {sequence} ({body}); copy the get_acl_rules "
+                "rule verbatim"
             )
     return None
+
+
+def _permit_matches_flow(permit: AclPermit, flow: FlowSpec) -> bool:
+    """True when a permit op could serve a must_reach flow (F-02)."""
+    if flow.protocol.value.lower() != permit.protocol:
+        return False
+    if flow.dst_port != permit.dst_port:
+        return False
+    return _endpoint_covers(permit.src, flow.src_ip) and _endpoint_covers(
+        permit.dst, flow.dst_ip
+    )
+
+
+def _check_acl_repair_shape(
+    submission: CandidateSubmission,
+    acl_ops: list,
+    must_reach_targets: list[FlowSpec],
+) -> list[str]:
+    """Enforce the V1 ACL repair shape in Python (F-02, never via prompts).
+
+    A valid repair is exactly one remove_acl_line for the proposed-snapshot
+    deny rule plus one acl_permit at the same freed sequence, matching the
+    removed rule's match fields and serving a targeted must_reach flow.
+    """
+    errors: list[str] = []
+    removes = [op for op in acl_ops if isinstance(op, RemoveAclLine)]
+    permits = [op for op in acl_ops if isinstance(op, AclPermit)]
+    if (
+        len(acl_ops) != 2
+        or len(removes) != 1
+        or len(permits) != 1
+        or len(submission.operations) != 2
+    ):
+        return [
+            "V1 ACL repair must be exactly one remove_acl_line plus one "
+            "acl_permit (no acl_deny, no extra operations, no route/ACL mix)"
+        ]
+    remove, permit = removes[0], permits[0]
+    if (permit.node, permit.acl, permit.sequence_number) != (
+        remove.node,
+        remove.acl,
+        remove.sequence_number,
+    ):
+        errors.append(
+            "acl_permit must reuse the exact node, ACL, and sequence freed "
+            "by the same-candidate remove_acl_line"
+        )
+    expected = remove.expected_rule
+    if expected.action != AclAction.DENY:
+        errors.append("remove_acl_line must target the evidenced deny rule")
+    elif (
+        permit.src != expected.src
+        or permit.dst != expected.dst
+        or permit.protocol != expected.protocol
+        or permit.dst_port != expected.dst_port
+    ):
+        errors.append(
+            "acl_permit must match the removed rule's source, destination, "
+            "protocol, and destination port exactly (only the action changes)"
+        )
+    if not any(_permit_matches_flow(permit, flow) for flow in must_reach_targets):
+        errors.append(
+            "acl_permit must serve a targeted must_reach flow (protocol, "
+            "destination port, and addresses must admit that flow)"
+        )
+    return errors
+
+
+def _check_trace_attribution(
+    ctx: _RunContext, remove: RemoveAclLine, relevant_flow_ids: list[str]
+) -> list[str]:
+    """Require trace_flow evidence attributing the denial (F-04, R-2).
+
+    get_acl_rules inventory alone is insufficient: a unique-match trace
+    attribution for the relevant flow on the proposed snapshot must name
+    the same node, ACL, and sequence the candidate removes.
+
+    R-2: only the specific target must_reach flow(s) the permit serves
+    are relevant. Attributions belonging to unrelated flows are ignored
+    and can neither support nor veto this candidate.
+    """
+    wanted = (remove.node, remove.acl, remove.sequence_number)
+    seen_resolutions: set[str] = set()
+    agreeing = False
+    conflicting: list[tuple] = []
+    for evidence_id in ctx.store.ids():
+        record = ctx.store.get(evidence_id)
+        if record is None or record.tool != "trace_flow":
+            continue
+        if record.flow_id not in relevant_flow_ids:
+            continue
+        if ctx.proposed.name not in record.snapshots:
+            continue
+        matches = record.details.get("acl_matches")
+        if not isinstance(matches, list):
+            continue
+        for match in matches:
+            if not isinstance(match, dict):
+                continue
+            resolution = match.get("resolution")
+            if isinstance(resolution, str):
+                seen_resolutions.add(resolution)
+            if resolution != "unique-match":
+                continue
+            triple = (match.get("node"), match.get("filter"), match.get("sequence_number"))
+            if triple == wanted:
+                agreeing = True
+            else:
+                conflicting.append(triple)
+    if conflicting:
+        return [
+            f"trace_flow evidence attributes the denial to {conflicting[0]}, "
+            f"not to {(remove.node, remove.acl, remove.sequence_number)}; "
+            "conflicting attribution cannot support this candidate"
+        ]
+    if agreeing:
+        return []
+    observed = sorted(seen_resolutions) or ["no attribution"]
+    return [
+        "trace_flow evidence does not uniquely attribute the target flow's "
+        f"denial to {(remove.node, remove.acl, remove.sequence_number)} "
+        f"(observed: {', '.join(observed)}); ACL inventory alone is insufficient"
+    ]
 
 
 def _handle_submission(ctx: _RunContext, args: dict) -> dict:
@@ -343,21 +581,61 @@ def _handle_submission(ctx: _RunContext, args: dict) -> dict:
         errors.append(f"unknown target_flow_ids (not in intent): {unknown}")
     if not 1 <= len(submission.operations) <= 5:
         errors.append("operations must hold 1-5 PatchOperations")
-    for op in submission.operations:
-        if isinstance(op, (AddStaticRoute, RemoveStaticRoute)):
-            problem = _check_route_support(
-                ctx, node=op.node, prefix=op.prefix, next_hop=op.next_hop
-            )
-        else:
+    all_flows = (*ctx.intent.must_reach, *ctx.intent.must_not_reach)
+    targets = [f for f in all_flows if f.flow_id in submission.target_flow_ids]
+    must_reach_targets = [
+        f for f in ctx.intent.must_reach if f.flow_id in submission.target_flow_ids
+    ]
+    route_ops = [
+        op
+        for op in submission.operations
+        if isinstance(op, (AddStaticRoute, RemoveStaticRoute))
+    ]
+    acl_ops = [
+        op
+        for op in submission.operations
+        if not isinstance(op, (AddStaticRoute, RemoveStaticRoute))
+    ]
+    for op in route_ops:
+        errors.extend(_check_route_op(ctx, op, targets))
+    if acl_ops:
+        # F-02: the V1 repair shape is enforced before per-op evidence.
+        errors.extend(_check_acl_repair_shape(submission, acl_ops, must_reach_targets))
+        removes = [op for op in acl_ops if isinstance(op, RemoveAclLine)]
+        permits = [op for op in acl_ops if isinstance(op, AclPermit)]
+        if len(removes) == 1 and len(acl_ops) == 2 and len(submission.operations) == 2:
+            remove = removes[0]
             problem = _check_acl_support(
                 ctx,
-                node=op.node,
-                acl=op.acl,
-                sequence=op.sequence_number,
-                expected=op.expected_rule if isinstance(op, RemoveAclLine) else None,
+                node=remove.node,
+                acl=remove.acl,
+                sequence=remove.sequence_number,
+                expected=remove.expected_rule,
             )
-        if problem is not None:
-            errors.append(problem)
+            if problem is not None:
+                errors.append(problem)
+            else:
+                # F-01 inventory corroboration passed; F-04/R-2 still
+                # require trace attribution of the same rule, scoped to
+                # the must_reach flow(s) the permit actually serves.
+                relevant = [
+                    flow.flow_id
+                    for flow in must_reach_targets
+                    if permits and _permit_matches_flow(permits[0], flow)
+                ]
+                errors.extend(_check_trace_attribution(ctx, remove, relevant))
+        else:
+            for acl_op in acl_ops:
+                if isinstance(acl_op, RemoveAclLine):
+                    problem = _check_acl_support(
+                        ctx,
+                        node=acl_op.node,
+                        acl=acl_op.acl,
+                        sequence=acl_op.sequence_number,
+                        expected=acl_op.expected_rule,
+                    )
+                    if problem is not None:
+                        errors.append(problem)
     if errors:
         ctx.submission_failures += 1
         return {
@@ -438,8 +716,13 @@ def _run_loop(
         if not calls:
             return narrative
         assistant_calls: list[dict] = []
-        for item in calls:
-            call_id = str(item.get("id") or f"call-{used}")
+        for idx, raw in enumerate(calls):
+            # F-10: tolerate malformed batch entries and mint a unique
+            # fallback ID per (admitted-slot, batch-index) pair. Build-time
+            # ``used`` is strictly increasing across batches, so fallbacks
+            # can never collide with each other.
+            item = raw if isinstance(raw, dict) else {}
+            call_id = str(item.get("id") or f"local-{used}-{idx}")
             name = str(item.get("name") or "")
             raw_args = item.get("arguments")
             args_text = raw_args if isinstance(raw_args, str) else json.dumps(raw_args or {})
@@ -452,6 +735,11 @@ def _run_loop(
             )
         messages.append({"role": "assistant", "content": content, "tool_calls": assistant_calls})
         for entry in assistant_calls:
+            if used >= budget:
+                # F-10: the budget is enforced before admitting each call.
+                # Calls beyond the budget are neither executed nor logged;
+                # the loop ends right after this batch.
+                break
             call_id = entry["id"]
             name = entry["function"]["name"]
             args_text = entry["function"]["arguments"]
@@ -463,12 +751,7 @@ def _run_loop(
                 args = {"_unparseable": args_text}
             started = time.perf_counter()
             evidence_id: str | None = None
-            if used >= budget:
-                content_out: dict = {
-                    "error": "tool budget exhausted",
-                    "detail": f"AGENT_MAX_TOOL_CALLS={budget} already used",
-                }
-            elif name == "submit_candidate_patch" and name not in registered:
+            if name == "submit_candidate_patch" and name not in registered:
                 content_out = {
                     "error": "candidates_not_allowed",
                     "detail": "candidate submission is not registered for this verdict",

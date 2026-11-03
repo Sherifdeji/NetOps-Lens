@@ -205,16 +205,78 @@ def test_get_acl_rules_execution_records_evidence():
     assert [r["sequence_number"] for r in rules] == [10, 20]
 
 
+ACL_BASE_SNAP = SnapshotRef(
+    name="base", path=str(REPO_ROOT / "lab" / "scenarios" / "acl_blocks_db" / "baseline")
+)
+ACL_PROP_SNAP = SnapshotRef(
+    name="prop", path=str(REPO_ROOT / "lab" / "scenarios" / "acl_blocks_db" / "proposed")
+)
+
+
 def _seed_routes(store: EvidenceStore) -> None:
     client = FakeClient(answers={("routes", "base"): [dict(ROUTE_ROW)]})
     result = get_routes(client, store, BASE, "r1")
     assert result.details["route_found"] is True
 
 
+def _seed_proposed_routes(store: EvidenceStore) -> None:
+    client = FakeClient(answers={("routes", "prop"): [dict(ROUTE_ROW)]})
+    result = get_routes(client, store, PROP, "r1")
+    assert result.details["route_found"] is True
+
+
+def _seed_ghost_routes(store: EvidenceStore) -> None:
+    ghost = SnapshotRef(name="ghost", path="b")
+    client = FakeClient(answers={("routes", "ghost"): [dict(ROUTE_ROW)]})
+    result = get_routes(client, store, ghost, "r1")
+    assert result.details["route_found"] is True
+
+
 def _seed_acl(store: EvidenceStore) -> list[dict]:
-    result = get_acl_rules(store, ACL_PROP, "r1", "DB-FILTER")
+    """Proposed-snapshot ACL inventory (name 'prop' matches the run context)."""
+    result = get_acl_rules(store, ACL_PROP_SNAP, "r1", "DB-FILTER")
     assert result.status == "ok", result.details
     return result.details["rules"]
+
+
+def _seed_baseline_acl(store: EvidenceStore) -> list[dict]:
+    result = get_acl_rules(store, ACL_BASE_SNAP, "r1", "DB-FILTER")
+    assert result.status == "ok", result.details
+    return result.details["rules"]
+
+
+def _seed_trace(
+    store: EvidenceStore,
+    *,
+    flow_id: str = "f-db",
+    snapshot: str = "prop",
+    resolution: str = "unique-match",
+    node: str = "r1",
+    acl: str = "DB-FILTER",
+    sequence: int = 10,
+) -> None:
+    store.record(
+        tool="trace_flow",
+        snapshots=[snapshot],
+        flow_id=flow_id,
+        disposition="DENIED_IN",
+        details={
+            "tool_status": "ok",
+            "final_disposition": "DENIED_IN",
+            "reachability": "UNREACHABLE",
+            "raw_dispositions": ["DENIED_IN"],
+            "traces": [{"disposition": "DENIED_IN", "hops": []}],
+            "trace_complete": True,
+            "acl_matches": [
+                {
+                    "node": node,
+                    "filter": acl,
+                    "resolution": resolution,
+                    "sequence_number": sequence,
+                }
+            ],
+        },
+    )
 
 
 def _rule_body(rule: dict) -> dict:
@@ -325,6 +387,7 @@ def _acl_submit(rule10: dict, *, sequence: int = 10, expected: dict | None = Non
 def test_guessed_acl_sequence_rejected():
     store = EvidenceStore()
     rules = _seed_acl(store)
+    _seed_trace(store)
     rule10 = next(r for r in rules if r["sequence_number"] == 10)
     script = [
         _resp(_call("submit_candidate_patch", _acl_submit(rule10, sequence=99), call_id="call-1")),
@@ -338,6 +401,7 @@ def test_guessed_acl_sequence_rejected():
 def test_unmatched_expected_rule_rejected():
     store = EvidenceStore()
     rules = _seed_acl(store)
+    _seed_trace(store)
     rule10 = next(r for r in rules if r["sequence_number"] == 10)
     wrong = dict(_rule_body(rule10))
     wrong["action"] = "permit"
@@ -353,6 +417,7 @@ def test_unmatched_expected_rule_rejected():
 def test_valid_acl_repair_accepted():
     store = EvidenceStore()
     rules = _seed_acl(store)
+    _seed_trace(store)
     rule10 = next(r for r in rules if r["sequence_number"] == 10)
     script = [
         _resp(_call("submit_candidate_patch", _acl_submit(rule10))),
@@ -394,7 +459,7 @@ def test_unguessed_route_rejected_without_evidence():
         _resp(content="stopped"),
     ]
     result, transport, _ = _run(script)
-    assert "need tool evidence" in _tool_text(transport)
+    assert "same-snapshot tool evidence" in _tool_text(transport)
     assert result.candidates == []
 
 
@@ -452,6 +517,47 @@ def test_agent_max_tool_calls_enforced():
     assert "exhausted" in (result.narrative or "")
 
 
+def test_budget_enforced_before_each_call_in_a_batch():
+    # F-10: with budget 1 and two calls in one response, the second call
+    # is neither executed nor logged (no "budget exhausted" pseudo-result).
+    one = _call("trace_flow", {"flow_id": "f-db", "snapshot": "baseline"}, call_id="a")
+    two = _call("trace_flow", {"flow_id": "f-db", "snapshot": "proposed"}, call_id="b")
+    script = [_resp(one, two, content="working")]
+    client = FakeClient(
+        answers={
+            ("traceroute", "base"): [trace_row("ACCEPTED")],
+            ("traceroute", "prop"): [trace_row("NO_ROUTE")],
+        }
+    )
+    settings = Settings(agent_max_tool_calls=1)
+    result, transport, _ = _run(script, settings=settings, client=client)
+    assert len(result.tool_activity) == 1
+    assert len(client.calls) == 1  # second call never executed
+    assert "budget" not in _tool_text(transport)
+    assert result.narrative == "working"
+
+
+def test_fallback_call_ids_are_unique_within_a_batch():
+    # F-10: two provider-id-less calls in one batch get distinct IDs.
+    first = {
+        "name": "trace_flow",
+        "arguments": json.dumps({"flow_id": "f-db", "snapshot": "baseline"}),
+    }
+    second = {
+        "name": "trace_flow",
+        "arguments": json.dumps({"flow_id": "f-db", "snapshot": "baseline"}),
+    }
+    script = [_resp(first, second), _resp(content="done")]
+    client = FakeClient(answers={("traceroute", "base"): [trace_row("ACCEPTED")]})
+    settings = Settings(agent_max_tool_calls=5)
+    result, transport, _ = _run(script, settings=settings, client=client)
+    assert len(result.tool_activity) == 2
+    tool_messages = [m for m in transport.messages_seen[-1] if m.get("role") == "tool"]
+    assert len(tool_messages) == 2
+    assert tool_messages[0]["tool_call_id"] != tool_messages[1]["tool_call_id"]
+    assert len(client.calls) == 2
+
+
 def test_unknown_finding_ids_hidden_in_narrative():
     script = [_resp(content="Root cause per [f-0001]; also see [f-9999].")]
     result, _, _ = _run(script)
@@ -462,22 +568,58 @@ def test_unknown_finding_ids_hidden_in_narrative():
 
 
 def test_tools_for_verdict_registration():
+    # F-05: only REGRESSION_DETECTED registers any tools at all.
     regression = {t["function"]["name"] for t in tools_for_verdict("REGRESSION_DETECTED")}
     assert regression == {"trace_flow", "get_routes", "get_acl_rules", "submit_candidate_patch"}
-    clean = {t["function"]["name"] for t in tools_for_verdict("NO_REGRESSION_DETECTED")}
-    assert clean == {"trace_flow", "get_routes", "get_acl_rules"}
+    assert tools_for_verdict("NO_REGRESSION_DETECTED") == []
     assert tools_for_verdict("INCONCLUSIVE") == []
     assert submit_tool_spec()["function"]["name"] == "submit_candidate_patch"
 
 
-def test_no_regression_registers_no_submission_tool():
+def test_no_regression_registers_no_tools():
     script = [_resp(content="All checks passed; nothing to fix.")]
     result, transport, _ = _run(script, verdict="NO_REGRESSION_DETECTED")
-    assert "submit_candidate_patch" not in transport.tools_seen[0]
-    assert set(transport.tools_seen[0]) == {"trace_flow", "get_routes", "get_acl_rules"}
+    assert transport.tools_seen[0] == []
     assert result.candidates == []
     assert result.tool_activity == []
     assert result.narrative == "All checks passed; nothing to fix."
+
+
+def test_prompt_names_tools_only_for_regression():
+    # F-11: the prompt must never claim tools Python did not register.
+    from netops_lens import prompts as prompt_module
+
+    regression = prompt_module.build_system_prompt(
+        verdict="REGRESSION_DETECTED", allow_candidates=True
+    )
+    for tool in ("trace_flow", "get_routes", "get_acl_rules", "submit_candidate_patch"):
+        assert tool in regression
+    assert "proposed snapshot" in regression
+    for verdict in ("NO_REGRESSION_DETECTED", "INCONCLUSIVE"):
+        text = prompt_module.build_system_prompt(verdict=verdict, allow_candidates=False)
+        for tool in ("trace_flow", "get_routes", "get_acl_rules", "submit_candidate_patch"):
+            assert tool not in text, (verdict, tool)
+        assert "No investigation tools" in text
+
+
+def test_prompt_inconclusive_names_untrusted_snapshots():
+    from netops_lens import prompts as prompt_module
+
+    text = prompt_module.build_system_prompt(verdict="INCONCLUSIVE", allow_candidates=False)
+    assert "untrusted" in text
+
+
+def test_user_context_hides_submission_for_explain_only_verdicts():
+    from netops_lens import prompts as prompt_module
+
+    regression = prompt_module.build_user_context(
+        _assessment("REGRESSION_DETECTED"), _intent(), question=""
+    )
+    assert "valid submit_candidate_patch targets" in regression
+    for verdict in ("NO_REGRESSION_DETECTED", "INCONCLUSIVE"):
+        text = prompt_module.build_user_context(_assessment(verdict), _intent(), question="")
+        assert "submit_candidate_patch targets" not in text
+        assert "no patch submission" in text
 
 
 def test_inconclusive_registers_no_tools():
@@ -537,3 +679,352 @@ def test_assessment_hash_unchanged_across_stage_b():
     assert len(result.tool_activity) == 1
     # Immutability itself is proven by tests/test_immutability.py; the
     # _run helper already asserts hash equality around every Stage B run.
+
+
+def _submit(args: dict) -> list[dict]:
+    return [_resp(_call("submit_candidate_patch", args)), _resp(content="stopped")]
+
+
+# --- F-01: snapshot-scoped evidence ------------------------------------
+
+
+def test_baseline_only_acl_evidence_cannot_authorize_removal():
+    # Baseline evidence lives under snapshots == ["base"]; the
+    # proposed-scoped lookup must not see it at all.
+    probe = EvidenceStore()
+    proposed_rules = _seed_acl(probe)
+    rule10 = next(r for r in proposed_rules if r["sequence_number"] == 10)
+    only_baseline = EvidenceStore()
+    _seed_baseline_acl(only_baseline)
+    _seed_trace(only_baseline)
+    result, transport, _ = _run(_submit(_acl_submit(rule10)), store=only_baseline)
+    assert "no proposed-snapshot get_acl_rules evidence" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_acl_evidence_insertion_order_does_not_change_acceptance():
+    rules_prop: list[dict] = []
+    for order in ("proposed-first", "baseline-first"):
+        store = EvidenceStore()
+        if order == "proposed-first":
+            rules_prop = _seed_acl(store)
+            _seed_baseline_acl(store)
+        else:
+            _seed_baseline_acl(store)
+            rules_prop = _seed_acl(store)
+        _seed_trace(store)
+        rule10 = next(r for r in rules_prop if r["sequence_number"] == 10)
+        result, _, _ = _run(_submit(_acl_submit(rule10)), store=store)
+        assert result.candidates and result.candidates[0].candidate_id == "c-01", order
+
+
+def test_baseline_route_evidence_cannot_authorize_removal():
+    store = EvidenceStore()
+    _seed_routes(store)  # baseline only
+    args = {
+        "rationale": "remove the route",
+        "operations": [
+            {
+                "op": "remove_static_route",
+                "node": "r1",
+                "prefix": "198.51.100.0/24",
+                "next_hop": "10.0.12.2",
+            }
+        ],
+        "target_flow_ids": ["f-db"],
+    }
+    result, transport, _ = _run(_submit(args), store=store)
+    assert "no proposed get_routes evidence" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_proposed_route_evidence_cannot_authorize_addition():
+    store = EvidenceStore()
+    _seed_proposed_routes(store)  # proposed only
+    result, transport, _ = _run(_submit(_route_submit()), store=store)
+    assert "no baseline get_routes evidence" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_unrelated_run_evidence_cannot_authorize_candidate():
+    store = EvidenceStore()
+    _seed_ghost_routes(store)  # snapshots == ["ghost"], never this run's
+    result, transport, _ = _run(_submit(_route_submit()), store=store)
+    assert "no baseline get_routes evidence" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_valid_remove_static_route_accepted():
+    store = EvidenceStore()
+    _seed_proposed_routes(store)
+    args = {
+        "rationale": "remove the evidenced proposed route",
+        "operations": [
+            {
+                "op": "remove_static_route",
+                "node": "r1",
+                "prefix": "198.51.100.0/24",
+                "next_hop": "10.0.12.2",
+            }
+        ],
+        "target_flow_ids": ["f-db"],
+    }
+    result, _, _ = _run(_submit(args), store=store)
+    assert len(result.candidates) == 1
+    assert result.candidates[0].candidate_id == "c-01"
+
+
+# --- F-03: route-to-flow binding ----------------------------------------
+
+
+def _seed_extra_prefix(store: EvidenceStore) -> None:
+    rows = [
+        dict(ROUTE_ROW),
+        {"Network": "10.99.0.0/24", "Protocol": "static", "Next_Hop": {"ip": "10.0.12.2"}},
+    ]
+    client = FakeClient(answers={("routes", "base"): rows})
+    result = get_routes(client, store, BASE, "r1")
+    assert result.details["route_found"] is True
+
+
+def test_unrelated_prefix_rejected_despite_matching_hop():
+    store = EvidenceStore()
+    _seed_extra_prefix(store)
+    result, transport, _ = _run(_submit(_route_submit(prefix="10.99.0.0/24")), store=store)
+    assert "covers the destination of no target flow" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_wrong_next_hop_rejected():
+    store = EvidenceStore()
+    _seed_routes(store)
+    result, transport, _ = _run(_submit(_route_submit(hop="10.0.12.99")), store=store)
+    assert "no baseline get_routes evidence" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_wrong_node_rejected():
+    store = EvidenceStore()
+    _seed_routes(store)
+    args = _route_submit()
+    args["operations"][0]["node"] = "r9"  # type: ignore[index]
+    result, transport, _ = _run(_submit(args), store=store)
+    assert "no baseline get_routes evidence" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_non_static_protocol_row_rejected():
+    store = EvidenceStore()
+    row = dict(ROUTE_ROW)
+    row["Protocol"] = "ospf"
+    client = FakeClient(answers={("routes", "base"): [row]})
+    result = get_routes(client, store, BASE, "r1")
+    assert result.details["route_found"] is True
+    result, transport, _ = _run(_submit(_route_submit()), store=store)
+    assert "no baseline get_routes evidence" in _tool_text(transport)
+    assert result.candidates == []
+
+
+# --- F-02: V1 ACL repair shape ------------------------------------------
+
+
+def _repair_args(rule10: dict) -> dict:
+    return _acl_submit(rule10)
+
+
+def test_permit_without_removal_rejected():
+    store = EvidenceStore()
+    rules = _seed_acl(store)
+    _seed_trace(store)
+    rule10 = next(r for r in rules if r["sequence_number"] == 10)
+    full = _repair_args(rule10)
+    permit_only = dict(full)
+    permit_only["operations"] = [full["operations"][1]]
+    result, transport, _ = _run(_submit(permit_only), store=store)
+    assert "exactly one remove_acl_line plus one acl_permit" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_permit_at_occupied_sequence_rejected():
+    store = EvidenceStore()
+    rules = _seed_acl(store)
+    _seed_trace(store, sequence=20)
+    rule10 = next(r for r in rules if r["sequence_number"] == 10)
+    args = _repair_args(rule10)
+    args["operations"][1]["sequence_number"] = 20  # type: ignore[index]
+    result, transport, _ = _run(_submit(args), store=store)
+    assert "must reuse the exact node, ACL, and sequence freed" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_permit_for_wrong_flow_rejected():
+    # A well-formed repair for TCP/22 matches no must_reach target.
+    store = EvidenceStore()
+    rules = _seed_acl(store)
+    rule20 = next(r for r in rules if r["sequence_number"] == 20)
+    _seed_trace(store, sequence=20)
+    body = _rule_body(rule20)
+    args = {
+        "rationale": "repair the wrong port",
+        "operations": [
+            {
+                "op": "remove_acl_line",
+                "node": "r1",
+                "acl": "DB-FILTER",
+                "sequence_number": 20,
+                "expected_rule": body,
+            },
+            {
+                "op": "acl_permit",
+                "node": "r1",
+                "acl": "DB-FILTER",
+                "sequence_number": 20,
+                "src": rule20["src"],
+                "dst": rule20["dst"],
+                "protocol": rule20["protocol"],
+                "dst_port": rule20["dst_port"],
+            },
+        ],
+        "target_flow_ids": ["f-block"],
+    }
+    result, transport, _ = _run(_submit(args), store=store)
+    assert "must serve a targeted must_reach flow" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_mismatched_permit_fields_rejected():
+    store = EvidenceStore()
+    rules = _seed_acl(store)
+    _seed_trace(store)
+    rule10 = next(r for r in rules if r["sequence_number"] == 10)
+    args = _repair_args(rule10)
+    args["operations"][1]["src"] = "any"  # type: ignore[index]
+    result, transport, _ = _run(_submit(args), store=store)
+    assert "must match the removed rule's source" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_mismatched_permit_protocol_rejected():
+    store = EvidenceStore()
+    rules = _seed_acl(store)
+    _seed_trace(store)
+    rule10 = next(r for r in rules if r["sequence_number"] == 10)
+    args = _repair_args(rule10)
+    args["operations"][1]["protocol"] = "udp"  # type: ignore[index]
+    result, transport, _ = _run(_submit(args), store=store)
+    assert "must match the removed rule's source" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_deny_op_outside_repair_shape_rejected():
+    store = EvidenceStore()
+    rules = _seed_acl(store)
+    _seed_trace(store)
+    rule10 = next(r for r in rules if r["sequence_number"] == 10)
+    args = _repair_args(rule10)
+    args["operations"][1]["op"] = "acl_deny"  # type: ignore[index]
+    result, transport, _ = _run(_submit(args), store=store)
+    assert "exactly one remove_acl_line plus one acl_permit" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_extra_operation_outside_repair_shape_rejected():
+    store = EvidenceStore()
+    rules = _seed_acl(store)
+    _seed_trace(store)
+    rule10 = next(r for r in rules if r["sequence_number"] == 10)
+    args = _repair_args(rule10)
+    args["operations"].append(  # type: ignore[attr-defined]
+        {
+            "op": "add_static_route",
+            "node": "r1",
+            "prefix": "198.51.100.0/24",
+            "next_hop": "10.0.12.2",
+        }
+    )
+    result, transport, _ = _run(_submit(args), store=store)
+    assert "no route/ACL mix" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_removal_of_nonexistent_rule_rejected():
+    store = EvidenceStore()
+    rules = _seed_acl(store)
+    _seed_trace(store)
+    rule10 = next(r for r in rules if r["sequence_number"] == 10)
+    args = _acl_submit(rule10, sequence=99)
+    result, transport, _ = _run(_submit(args), store=store)
+    assert "is not evidenced" in _tool_text(transport)
+    assert result.candidates == []
+
+
+# --- R-2: attribution scoped to the relevant flow ------------------------
+
+
+def test_unrelated_target_flow_attribution_does_not_veto_valid_repair():
+    # R-2: f-db uniquely attributes the seq-10 deny; f-block (also
+    # targeted) uniquely attributes a different rule. The f-db repair
+    # must still be accepted: unrelated attributions neither support
+    # nor veto it.
+    store = EvidenceStore()
+    rules = _seed_acl(store)
+    rule10 = next(r for r in rules if r["sequence_number"] == 10)
+    _seed_trace(store)
+    _seed_trace(store, flow_id="f-block", sequence=20)
+    args = _acl_submit(rule10)
+    args["target_flow_ids"] = ["f-db", "f-block"]
+    result, _, _ = _run(_submit(args), store=store)
+    assert len(result.candidates) == 1
+    assert result.candidates[0].candidate_id == "c-01"
+
+
+# --- F-04: trace attribution --------------------------------------------
+
+
+def test_acl_repair_rejected_without_trace_attribution():
+    store = EvidenceStore()
+    rules = _seed_acl(store)
+    rule10 = next(r for r in rules if r["sequence_number"] == 10)
+    result, transport, _ = _run(_submit(_acl_submit(rule10)), store=store)
+    assert "ACL inventory alone is insufficient" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_acl_repair_rejected_on_ambiguous_attribution():
+    store = EvidenceStore()
+    rules = _seed_acl(store)
+    _seed_trace(store, resolution="ambiguous")
+    rule10 = next(r for r in rules if r["sequence_number"] == 10)
+    result, transport, _ = _run(_submit(_acl_submit(rule10)), store=store)
+    assert "ambiguous" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_acl_repair_rejected_on_wrong_acl_attribution():
+    store = EvidenceStore()
+    rules = _seed_acl(store)
+    _seed_trace(store, acl="OTHER-ACL")
+    rule10 = next(r for r in rules if r["sequence_number"] == 10)
+    result, transport, _ = _run(_submit(_acl_submit(rule10)), store=store)
+    assert "conflicting attribution" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_acl_repair_rejected_on_wrong_sequence_attribution():
+    store = EvidenceStore()
+    rules = _seed_acl(store)
+    _seed_trace(store, sequence=20)
+    rule10 = next(r for r in rules if r["sequence_number"] == 10)
+    result, transport, _ = _run(_submit(_acl_submit(rule10)), store=store)
+    assert "conflicting attribution" in _tool_text(transport)
+    assert result.candidates == []
+
+
+def test_acl_repair_ignores_other_flow_trace():
+    store = EvidenceStore()
+    rules = _seed_acl(store)
+    _seed_trace(store, flow_id="f-block")
+    rule10 = next(r for r in rules if r["sequence_number"] == 10)
+    result, transport, _ = _run(_submit(_acl_submit(rule10)), store=store)
+    assert "does not uniquely attribute" in _tool_text(transport)
+    assert result.candidates == []

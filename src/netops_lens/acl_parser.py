@@ -14,6 +14,7 @@ text is preserved verbatim in ``raw_line``.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from ipaddress import IPv4Address, IPv4Network
 from pathlib import Path
@@ -140,8 +141,18 @@ def parse_extended_acl(config_text: str, acl_name: str) -> tuple[ParsedAclRule, 
 
 
 def load_node_acl(snapshot_dir: str | Path, node: str, acl_name: str) -> tuple[ParsedAclRule, ...]:
-    """Read ``<node>.cfg`` inside a snapshot dir and parse one ACL stanza."""
-    config_path = Path(snapshot_dir) / "configs" / f"{node}.cfg"
-    if not config_path.is_file():
-        raise AclParseError(f"config not found: {config_path}")
+    """Read ``<node>.cfg`` inside a snapshot dir and parse one ACL stanza.
+
+    F-08: a model-supplied node name must never become an arbitrary
+    filesystem path. The name is restricted to a flat filename vocabulary
+    (no separators, no ``.``/``..``), and the resolved file must remain
+    inside the snapshot's ``configs/`` directory. Nothing outside the
+    approved snapshot directory is ever opened.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", node) or node in (".", ".."):
+        raise AclParseError(f"invalid node name: {node!r}")
+    configs_dir = Path(snapshot_dir) / "configs"
+    config_path = (configs_dir / f"{node}.cfg").resolve()
+    if config_path.parent != configs_dir.resolve() or not config_path.is_file():
+        raise AclParseError(f"config not found for node {node!r}")
     return parse_extended_acl(config_path.read_text(), acl_name)

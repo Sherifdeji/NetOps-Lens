@@ -50,6 +50,45 @@ def test_load_node_acl_reads_snapshot_file():
         load_node_acl(REPO_ROOT / "lab/scenarios/acl_blocks_db/baseline", "r1", "NOPE")
 
 
+def _snapshot() -> Path:
+    return REPO_ROOT / "lab/scenarios/acl_blocks_db/baseline"
+
+
+def test_load_node_acl_rejects_traversal():
+    for evil in ("../r1", "..", ".", "r1/../../r1", "sub/dir", "/etc/passwd", "r1.cfg", ""):
+        with pytest.raises(AclParseError):
+            load_node_acl(_snapshot(), evil, "DB-FILTER")
+
+
+def test_load_node_acl_rejects_absolute_and_nested_paths(tmp_path: Path):
+    outside = tmp_path / "evil.cfg"
+    outside.write_text("hostname evil\n")
+    with pytest.raises(AclParseError):
+        load_node_acl(_snapshot(), str(outside), "DB-FILTER")
+    with pytest.raises(AclParseError):
+        load_node_acl(_snapshot(), "configs/r1", "DB-FILTER")
+
+
+def test_load_node_acl_unknown_node_is_not_a_filesystem_probe():
+    # r9 is a valid name shape but absent: a clean "not found", and the
+    # error must not echo an attacker-controlled filesystem path.
+    with pytest.raises(AclParseError) as excinfo:
+        load_node_acl(_snapshot(), "r9", "DB-FILTER")
+    assert "r9.cfg" not in str(excinfo.value)
+    assert ".." not in str(excinfo.value)
+
+
+def test_load_node_acl_valid_nodes():
+    base = _snapshot()
+    first = load_node_acl(base, "r1", "DB-FILTER")
+    assert [r.sequence_number for r in first] == [10, 20]
+    if (base / "configs" / "r2.cfg").is_file():
+        try:
+            assert isinstance(load_node_acl(base, "r2", "DB-FILTER"), tuple)
+        except AclParseError:
+            pass  # valid name, clean scoping; stanza simply absent on r2
+
+
 def test_parse_endpoints_and_protocols():
     assert parse_acl_rule_line("10 permit ip any any").rule.protocol == "ip"
     assert parse_acl_rule_line("5 deny tcp host 192.0.2.10 any eq 22").rule.src == "host 192.0.2.10"
