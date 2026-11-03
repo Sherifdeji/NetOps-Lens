@@ -35,7 +35,8 @@ def _run(*argv: str) -> subprocess.CompletedProcess:
 @pytest.mark.parametrize("scenario", list(SCENARIOS))
 def test_cli_scenario_verdict_and_exit_code(batfish_session, scenario):
     del batfish_session  # health gate: skip with reason when Batfish is down
-    proc = _run("assess", "--scenario", scenario)
+    # --no-investigate keeps this deterministic (no Meta API calls).
+    proc = _run("assess", "--scenario", scenario, "--no-investigate")
     expected_verdict, expected_code = SCENARIOS[scenario]
     assert proc.returncode == expected_code, proc.stderr
     assert f"Verdict: {expected_verdict}" in proc.stdout
@@ -43,7 +44,7 @@ def test_cli_scenario_verdict_and_exit_code(batfish_session, scenario):
 
 def test_cli_json_report_shape(batfish_session):
     del batfish_session
-    proc = _run("assess", "--scenario", "removed_route", "--json")
+    proc = _run("assess", "--scenario", "removed_route", "--json", "--no-investigate")
     assert proc.returncode == 0, proc.stderr
     report = json.loads(proc.stdout)
     assessment = report["assessment"]
@@ -57,13 +58,14 @@ def test_cli_json_report_shape(batfish_session):
     assert set(report["evidence_index"]), "evidence index must be populated"
 
 
-def test_cli_no_investigate_matches_assessment(batfish_session):
+def test_cli_no_investigate_skips_stage_b(batfish_session):
     del batfish_session
-    plain = json.loads(_run("assess", "--scenario", "healthy", "--json").stdout)
-    flagged = json.loads(
+    report = json.loads(
         _run("assess", "--scenario", "healthy", "--json", "--no-investigate").stdout
     )
-    assert plain["assessment"] == flagged["assessment"]
+    assert report["assessment"]["verdict"] == "NO_REGRESSION_DETECTED"
+    assert report["investigation"] is None
+    assert report["verifications"] == []
 
 
 def test_cli_usage_errors_exit_1():

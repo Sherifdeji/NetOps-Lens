@@ -1,8 +1,9 @@
-"""First functional interface: deterministic assessment over CLI.
+"""CLI: mandatory Stage A assessment plus verdict-gated Stage B investigation.
 
-Phase 2 runs Stage A only. ``--no-investigate`` is accepted as a safe no-op:
-it can never change what Stage A executes. No Muse or Meta API calls exist
-on this path.
+``--no-investigate`` skips Stage B and preserves the exact Stage A output:
+no Muse or Meta API calls exist on that path. Default runs execute Stage B
+while the run-scoped Batfish network is still alive; cleanup happens only
+after the complete pipeline finishes.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from typing import NoReturn
 
 import yaml
 
+from netops_lens.agent import run_stage_b
 from netops_lens.assessment import AssessmentError, run_mandatory_assessment
 from netops_lens.batfish_client import BatfishClient, BatfishError
 from netops_lens.config import load_settings
@@ -65,7 +67,7 @@ def build_parser() -> Exit1ArgumentParser:
     assess.add_argument(
         "--no-investigate",
         action="store_true",
-        help="Phase 2 no-op: investigation does not exist yet; never affects Stage A",
+        help="skip Stage B investigation; never affects Stage A",
     )
     assess.add_argument("--out", help="write the full Report JSON to this file")
     assess.add_argument(
@@ -94,6 +96,25 @@ def _resolve_inputs(args: argparse.Namespace) -> tuple[Path, Path, Path, str]:
     if not (args.baseline and args.proposed and args.intent):
         raise IntentError("provide --scenario or all of --baseline/--proposed/--intent")
     return Path(args.baseline), Path(args.proposed), Path(args.intent), "manual"
+
+
+def _print_investigation(report: Report) -> None:
+    investigation = report.investigation
+    if investigation is None:
+        return
+    print("Investigation (Muse Spark):")
+    if investigation.narrative:
+        for line in investigation.narrative.splitlines():
+            print(f"  {line}")
+    else:
+        print("  (no narrative)")
+    print(f"  Tool calls: {len(investigation.tool_activity)}")
+    if investigation.candidates:
+        for candidate in investigation.candidates:
+            ops = ", ".join(op.op for op in candidate.operations)
+            print(f"  Candidate {candidate.candidate_id}: {ops}")
+    else:
+        print("  Candidates: none")
 
 
 def _print_human(report: Report, *, tag: str) -> None:
@@ -127,6 +148,7 @@ def _print_human(report: Report, *, tag: str) -> None:
         print(f"  {health.snapshot}: {health.status} ({detail})")
     if assessment.verdict == "NO_REGRESSION_DETECTED":
         print("Note: only tested flows are covered; untested traffic is not claimed safe.")
+    _print_investigation(report)
 
 
 def run_network_name(prefix: str, tag: str) -> str:
@@ -209,12 +231,27 @@ def run_assess(args: argparse.Namespace) -> int:
             assessment = run_mandatory_assessment(
                 client, store, baseline_ref, proposed_ref, intent
             )
+            if args.no_investigate:
+                investigation = None
+            else:
+                # Stage B runs while the run-scoped network is still alive;
+                # it never raises and never mutates the Stage A assessment.
+                investigation = run_stage_b(
+                    client,
+                    store,
+                    assessment,
+                    intent,
+                    baseline_ref,
+                    proposed_ref,
+                    question=args.question,
+                )
             report = assemble_report(
                 assessment,
                 store,
                 expected_flow_ids=[
                     f.flow_id for f in (*intent.must_reach, *intent.must_not_reach)
                 ],
+                investigation=investigation,
             )
         except (AssessmentError, ReportError) as exc:
             print(f"assessment error: {exc}", file=sys.stderr)
