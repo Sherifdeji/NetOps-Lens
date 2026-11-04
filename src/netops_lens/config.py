@@ -37,6 +37,7 @@ class Settings(BaseModel):
         MAX_CANDIDATES               candidates per run (default 3)
         MAX_PATCH_RETRIES            candidate retry rounds (default 1)
         CANDIDATE_SUBMISSION_VARIANT "tool" or "structured_output" (default tool)
+        KEEP_CANDIDATE_DIRS "true"/"false" (default false)
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -52,6 +53,7 @@ class Settings(BaseModel):
     # Default "tool" is provisional until scripts/spike_meta_api.py confirms
     # the API accepts the nested submit_candidate_patch schema (Phase 0/3).
     candidate_submission_variant: SubmissionVariant = "tool"
+    keep_candidate_dirs: bool = False
 
 
 def _get_str(name: str, default: str) -> str:
@@ -70,6 +72,19 @@ def _get_int(name: str, default: int) -> int:
         return int(raw.strip())
     except ValueError as exc:
         raise RuntimeError(f"invalid_config: {name} must be an integer") from exc
+
+
+def _get_bool(name: str, default: bool) -> bool:
+    """Boolean setting; blank means the default, other non-bool text fails."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    lowered = raw.strip().lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    raise RuntimeError(f"invalid_config: {name} must be 'true' or 'false'")
 
 
 def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
@@ -93,6 +108,7 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
             max_candidates=_get_int("MAX_CANDIDATES", 3),
             max_patch_retries=_get_int("MAX_PATCH_RETRIES", 1),
             candidate_submission_variant=variant_raw,  # type: ignore[arg-type]
+            keep_candidate_dirs=_get_bool("KEEP_CANDIDATE_DIRS", False),
         )
     except ValidationError as exc:
         raise RuntimeError(f"invalid_config: {exc.errors()[0]['loc']}") from exc

@@ -14,7 +14,7 @@ is UNKNOWN.
 from __future__ import annotations
 
 from netops_lens.assessment import differential_consistency, reconcile_flow
-from netops_lens.batfish_client import BatfishClient
+from netops_lens.batfish_client import BatfishClient, is_candidate_snapshot_name
 from netops_lens.evidence import EvidenceStore
 from netops_lens.models import (
     AssessmentResult,
@@ -66,7 +66,7 @@ def _decide(checks: list[VerificationCheck]) -> VerificationStatus:
 
 def _assemble(
     candidate_id: str,
-    candidate_snapshot: str,
+    candidate_snapshot: str | None,
     checks: list[VerificationCheck],
     reasons: list[str],
 ) -> VerificationResult:
@@ -79,7 +79,7 @@ def _assemble(
     return VerificationResult(
         candidate_id=candidate_id,
         status=_decide(checks),
-        reasons=tuple(reasons),
+        reasons=tuple(dict.fromkeys(reasons)),
         checks=tuple(checks),
         evidence_ids=tuple(ordered),
         candidate_snapshot=candidate_snapshot,
@@ -147,6 +147,39 @@ def _required_reach(kind: FlowKind) -> Reachability:
     return "REACHABLE" if kind == "must_reach" else "UNREACHABLE"
 
 
+def _declared_flows(intent: Intent) -> list[tuple[FlowKind, FlowSpec]]:
+    return [("must_reach", f) for f in intent.must_reach] + [
+        ("must_not_reach", f) for f in intent.must_not_reach
+    ]
+
+
+def empty_skeleton(
+    candidate_id: str,
+    candidate_snapshot: str | None,
+    intent: Intent,
+    reason: str,
+    health_evidence: tuple[str, ...] = (),
+) -> VerificationResult:
+    """Full UNKNOWN check skeleton for prerequisites that never executed.
+
+    Every known intent flow gets ``intent:``, ``differential:`` and
+    ``no_regression:`` checks marked UNKNOWN with no evidence attached;
+    nothing is fabricated. Used for invalid snapshot identity, unusable
+    baseline references, unhealthy candidates, and snapshot-initialization
+    failures. ``candidate_snapshot`` is None when no candidate snapshot
+    was ever successfully created. ``health_evidence`` carries the real
+    minted health evidence ID when a candidate-health query actually ran;
+    every other unevaluated check keeps empty evidence.
+    """
+    prefixed = f"not executed: {reason}"
+    checks = [_check("candidate_health", "unknown", prefixed, health_evidence)]
+    for _, flow in _declared_flows(intent):
+        checks.append(_check(f"intent:{flow.flow_id}", "unknown", prefixed))
+        checks.append(_check(f"differential:{flow.flow_id}", "unknown", prefixed))
+        checks.append(_check(f"no_regression:{flow.flow_id}", "unknown", prefixed))
+    return _assemble(candidate_id, candidate_snapshot, checks, [c.detail for c in checks])
+
+
 def verify_candidate(
     client: BatfishClient,
     store: EvidenceStore,
@@ -166,9 +199,24 @@ def verify_candidate(
     reachability and health come from ``stage_a`` alone, never recomputed.
     """
     candidate_name = candidate_ref.name
-    flows: list[tuple[FlowKind, FlowSpec]] = [("must_reach", f) for f in intent.must_reach] + [
-        ("must_not_reach", f) for f in intent.must_not_reach
-    ]
+    # LOW-1 identity guard: never verify a baseline snapshot against
+    # itself, and never accept a non-canonical candidate name. This runs
+    # before any verification tool call.
+    if candidate_name == baseline_ref.name:
+        return empty_skeleton(
+            candidate_id,
+            None,
+            intent,
+            f"candidate snapshot '{candidate_name}' equals the baseline snapshot",
+        )
+    if not is_candidate_snapshot_name(candidate_name):
+        return empty_skeleton(
+            candidate_id,
+            None,
+            intent,
+            f"candidate snapshot '{candidate_name}' is not a canonical generated name",
+        )
+    flows = _declared_flows(intent)
     if not flows:
         return _assemble(
             candidate_id,
@@ -181,16 +229,15 @@ def verify_candidate(
     _, health_problem = _reference_health(stage_a, baseline_ref.name)
     baseline_reach, problems = _reference_comparisons(stage_a, flows)
     if health_problem is not None or problems:
-        checks = []
-        for _, flow in flows:
-            problem = problems.get(flow.flow_id)
-            detail = (
-                f"baseline reference unusable: {problem}"
-                if problem is not None
-                else f"baseline reference unusable: {health_problem}"
-            )
-            checks.append(_check(f"no_regression:{flow.flow_id}", "unknown", detail))
-        return _assemble(candidate_id, candidate_name, checks, [c.detail for c in checks])
+        parts = ([health_problem] if health_problem is not None else []) + [
+            problems[flow.flow_id] for _, flow in flows if flow.flow_id in problems
+        ]
+        return empty_skeleton(
+            candidate_id,
+            candidate_name,
+            intent,
+            f"baseline reference unusable: {'; '.join(parts)}",
+        )
 
     # Step 2 — candidate snapshot health (no flow checks on an unhealthy snapshot).
     try:
@@ -201,20 +248,25 @@ def verify_candidate(
         health_evidence, health_error = (), exc
         cand_health = None
     if health_error is not None:
-        detail = f"candidate health query raised {type(health_error).__name__}"
-        return _assemble(
-            candidate_id, candidate_name, [_check("candidate_health", "unknown", detail)], [detail]
+        return empty_skeleton(
+            candidate_id,
+            candidate_name,
+            intent,
+            f"candidate health query raised {type(health_error).__name__}",
         )
     if cand_health is None:  # defensive; try/except above prevents this
-        detail = "candidate health result missing"
-        return _assemble(
-            candidate_id, candidate_name, [_check("candidate_health", "unknown", detail)], [detail]
+        return empty_skeleton(
+            candidate_id, candidate_name, intent, "candidate health result missing"
         )
     if cand_health.status != "OK":
         joined = "; ".join(cand_health.reasons) if cand_health.reasons else "no reason recorded"
-        detail = f"candidate snapshot '{candidate_name}' health is {cand_health.status}: {joined}"
-        check = _check("candidate_health", "unknown", detail, health_evidence)
-        return _assemble(candidate_id, candidate_name, [check], [detail])
+        return empty_skeleton(
+            candidate_id,
+            candidate_name,
+            intent,
+            f"candidate snapshot '{candidate_name}' health is {cand_health.status}: {joined}",
+            health_evidence,
+        )
     checks = [
         _check(
             "candidate_health",

@@ -30,7 +30,8 @@ from tests._fakes import (
 
 START = "@enter(r1[GigabitEthernet0/1])"
 BASE = SnapshotRef(name="base", path="lab/baseline")
-CAND = SnapshotRef(name="cand", path="runs/r1/candidate-c-01")
+CAND_NAME = "run-candidate-c-01"
+CAND = SnapshotRef(name=CAND_NAME, path="runs/r1/candidate-c-01")
 
 
 def _web_flow() -> FlowSpec:
@@ -129,8 +130,8 @@ def _client(
 ) -> FakeClient:
     return FakeClient(
         answers={
-            ("traceroute", "cand"): tracerows,
-            ("differentialReachability", "cand"): diffrows,
+            ("traceroute", CAND_NAME): tracerows,
+            ("differentialReachability", CAND_NAME): diffrows,
         },
         health=health if health is not None else healthy_records(),
         failures=failures or set(),
@@ -152,7 +153,7 @@ def test_verified_repair_holds_and_checks_every_flow():
         intent=_intent(), stage_a=_stage_a(),
     )
     assert result.status == "VERIFIED"
-    assert result.candidate_snapshot == "cand"
+    assert result.candidate_snapshot == CAND_NAME
     assert result.reasons == ()
     assert _check_names(result) == [
         "candidate_health",
@@ -164,10 +165,10 @@ def test_verified_repair_holds_and_checks_every_flow():
         "no_regression:ssh",
     ]
     assert all(check.outcome == "pass" for check in result.checks)
-    assert client.asked("traceroute", "cand") == 2
-    assert client.asked("differentialReachability", "cand") == 2
+    assert client.asked("traceroute", CAND_NAME) == 2
+    assert client.asked("differentialReachability", CAND_NAME) == 2
     # Differential was queried baseline-first: the reference is the baseline.
-    assert ("differentialReachability", "cand", "base") in client.calls
+    assert ("differentialReachability", CAND_NAME, "base") in client.calls
     # Evidence is the ordered dedup union of per-check evidence, all minted here.
     flat: list[str] = []
     for check in result.checks:
@@ -180,7 +181,7 @@ def test_verified_repair_holds_and_checks_every_flow():
             assert record is not None
             expected_flow = check.name.split(":", 1)[-1]
             assert record.flow_id in (None, expected_flow)
-            assert "cand" in record.snapshots
+            assert CAND_NAME in record.snapshots
 
 
 def test_rejected_when_target_still_broken():
@@ -383,22 +384,46 @@ def test_candidate_health_not_ok_is_unverifiable_without_flow_checks():
         intent=_intent(), stage_a=_stage_a(),
     )
     assert result.status == "UNVERIFIABLE"
-    assert [c.name for c in result.checks] == ["candidate_health"]
-    assert result.checks[0].outcome == "unknown"
-    assert client.asked("traceroute", "cand") == 0
-    assert client.asked("differentialReachability", "cand") == 0
+    assert _check_names(result) == [
+        "candidate_health",
+        "intent:web",
+        "differential:web",
+        "no_regression:web",
+        "intent:ssh",
+        "differential:ssh",
+        "no_regression:ssh",
+    ]
+    assert all(c.outcome == "unknown" for c in result.checks)
+    assert all(c.evidence_ids == () for c in result.checks[1:])
+    # K-03: the real minted health evidence stays attached to the check.
+    assert result.checks[0].evidence_ids == tuple(store.ids())
+    assert len(result.checks[0].evidence_ids) == 1
+    record = store.get(result.checks[0].evidence_ids[0])
+    assert record is not None
+    assert record.snapshots == [CAND_NAME]
+    assert result.evidence_ids == result.checks[0].evidence_ids
+    assert client.asked("traceroute", CAND_NAME) == 0
+    assert client.asked("differentialReachability", CAND_NAME) == 0
 
 
 def test_candidate_health_query_error_is_unverifiable():
     store = EvidenceStore()
-    client = _client(tracerows=[], diffrows=[], failures={("__health__", "cand")})
+    client = _client(tracerows=[], diffrows=[], failures={("__health__", CAND_NAME)})
     result = verify_candidate(
         client, store, candidate_id="c-01", baseline_ref=BASE, candidate_ref=CAND,
         intent=_intent(), stage_a=_stage_a(),
     )
     assert result.status == "UNVERIFIABLE"
-    assert [c.name for c in result.checks] == ["candidate_health"]
-    assert result.checks[0].outcome == "unknown"
+    assert _check_names(result) == [
+        "candidate_health",
+        "intent:web",
+        "differential:web",
+        "no_regression:web",
+        "intent:ssh",
+        "differential:ssh",
+        "no_regression:ssh",
+    ]
+    assert all(c.outcome == "unknown" for c in result.checks)
 
 
 def test_missing_baseline_health_is_unverifiable():
@@ -412,8 +437,17 @@ def test_missing_baseline_health_is_unverifiable():
     )
     assert result.status == "UNVERIFIABLE"
     assert store.export_json() == before  # no candidate queries ran
-    assert {c.name for c in result.checks} == {"no_regression:web", "no_regression:ssh"}
+    assert _check_names(result) == [
+        "candidate_health",
+        "intent:web",
+        "differential:web",
+        "no_regression:web",
+        "intent:ssh",
+        "differential:ssh",
+        "no_regression:ssh",
+    ]
     assert all(c.outcome == "unknown" for c in result.checks)
+    assert all(c.evidence_ids == () for c in result.checks)
 
 
 def test_baseline_health_not_ok_is_unverifiable():
@@ -424,7 +458,7 @@ def test_baseline_health_not_ok_is_unverifiable():
         intent=_intent(), stage_a=_stage_a(base_health="NOT_OK"),
     )
     assert result.status == "UNVERIFIABLE"
-    assert client.asked("traceroute", "cand") == 0
+    assert client.asked("traceroute", CAND_NAME) == 0
 
 
 def test_health_tuple_order_does_not_matter():
@@ -453,7 +487,7 @@ def test_missing_baseline_flow_comparison_is_unverifiable():
         intent=_intent(), stage_a=stage_a,
     )
     assert result.status == "UNVERIFIABLE"
-    assert client.asked("traceroute", "cand") == 0
+    assert client.asked("traceroute", CAND_NAME) == 0
 
 
 def test_duplicate_baseline_flow_comparison_is_unverifiable():
@@ -542,7 +576,7 @@ def test_stage_a_immutable_across_failed_verification():
 
 def test_traceroute_tool_error_is_unknown_not_guessed():
     store = EvidenceStore()
-    client = _client(tracerows=[], diffrows=[], failures={("traceroute", "cand")})
+    client = _client(tracerows=[], diffrows=[], failures={("traceroute", CAND_NAME)})
     result = verify_candidate(
         client, store, candidate_id="c-01", baseline_ref=BASE, candidate_ref=CAND,
         intent=_intent(), stage_a=_stage_a(),
@@ -558,7 +592,7 @@ def test_differential_tool_error_is_unknown():
     client = _client(
         tracerows=[_web_row("ACCEPTED"), _ssh_row("DENIED_IN")],
         diffrows=[],
-        failures={("differentialReachability", "cand")},
+        failures={("differentialReachability", CAND_NAME)},
     )
     result = verify_candidate(
         client, store, candidate_id="c-01", baseline_ref=BASE, candidate_ref=CAND,
@@ -582,7 +616,7 @@ def test_unexpected_tool_exception_leaves_check_unknown_without_evidence():
     assert issubclass(_ExplodingClient, BatfishClient)
     store = EvidenceStore()
     client = _ExplodingClient(
-        answers={("differentialReachability", "cand"): []},
+        answers={("differentialReachability", CAND_NAME): []},
     )
     result = verify_candidate(
         client, store, candidate_id="c-01", baseline_ref=BASE, candidate_ref=CAND,
@@ -635,11 +669,44 @@ def test_result_has_snapshot_name_only_and_no_absolute_paths():
         client, store, candidate_id="c-01", baseline_ref=BASE, candidate_ref=CAND,
         intent=_intent(), stage_a=_stage_a(),
     )
-    assert result.candidate_snapshot == "cand"
+    assert result.candidate_snapshot == CAND_NAME
     blob = result.model_dump_json()
     assert "runs/" not in blob
     assert "/tmp" not in blob
-    assert json.loads(blob)["candidate_snapshot"] == "cand"
+    assert json.loads(blob)["candidate_snapshot"] == CAND_NAME
+
+
+def test_candidate_equal_to_baseline_rejected_before_tool_calls():
+    store = EvidenceStore()
+    client = _client(
+        tracerows=[_web_row("ACCEPTED"), _ssh_row("DENIED_IN")],
+        diffrows=[_web_diff("ACCEPTED", "ACCEPTED"), _ssh_diff("DENIED_IN", "DENIED_IN")],
+    )
+    same_as_baseline = SnapshotRef(name="base", path="lab/baseline")
+    result = verify_candidate(
+        client, store, candidate_id="c-01", baseline_ref=BASE, candidate_ref=same_as_baseline,
+        intent=_intent(), stage_a=_stage_a(),
+    )
+    assert result.status == "UNVERIFIABLE"
+    assert result.candidate_snapshot is None
+    assert client.asked("traceroute", "base") == 0
+    assert client.asked("differentialReachability", "base") == 0
+    assert _check_names(result)[0] == "candidate_health"
+    assert all(c.outcome == "unknown" for c in result.checks)
+
+
+def test_non_canonical_candidate_name_rejected_before_tool_calls():
+    store = EvidenceStore()
+    client = _client(tracerows=[], diffrows=[])
+    bogus = SnapshotRef(name="proposed", path="lab/proposed")
+    result = verify_candidate(
+        client, store, candidate_id="c-01", baseline_ref=BASE, candidate_ref=bogus,
+        intent=_intent(), stage_a=_stage_a(),
+    )
+    assert result.status == "UNVERIFIABLE"
+    assert result.candidate_snapshot is None
+    assert client.calls == []
+    assert any("canonical" in check.detail for check in result.checks)
 
 
 def test_empty_intent_is_unverifiable():
@@ -652,4 +719,4 @@ def test_empty_intent_is_unverifiable():
     )
     assert result.status == "UNVERIFIABLE"
     assert result.checks == ()
-    assert client.asked("traceroute", "cand") == 0
+    assert client.asked("traceroute", CAND_NAME) == 0

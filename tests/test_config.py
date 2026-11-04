@@ -25,6 +25,7 @@ CONFIG_VARS = [
     "MAX_CANDIDATES",
     "MAX_PATCH_RETRIES",
     "CANDIDATE_SUBMISSION_VARIANT",
+    "KEEP_CANDIDATE_DIRS",
 ]
 
 
@@ -108,3 +109,32 @@ def test_env_example_documents_configurable_vars():
     content = (Path(__file__).resolve().parent.parent / ".env.example").read_text()
     for var in ("META_API_BASE", "META_MODEL", "CANDIDATE_SUBMISSION_VARIANT"):
         assert var in content
+
+
+def test_keep_candidate_dirs_defaults_to_false(clean_env):
+    assert load_settings().keep_candidate_dirs is False
+
+
+def test_keep_candidate_dirs_accepts_case_insensitive(clean_env, monkeypatch):
+    for raw in ("true", "TRUE", " True "):
+        monkeypatch.setenv("KEEP_CANDIDATE_DIRS", raw)
+        assert load_settings().keep_candidate_dirs is True
+    for raw in ("false", "FALSE", " False "):
+        monkeypatch.setenv("KEEP_CANDIDATE_DIRS", raw)
+        assert load_settings().keep_candidate_dirs is False
+
+
+def test_keep_candidate_dirs_blank_means_default(clean_env, monkeypatch):
+    monkeypatch.setenv("KEEP_CANDIDATE_DIRS", "   ")
+    assert load_settings().keep_candidate_dirs is False
+
+
+def test_keep_candidate_dirs_invalid_value_fails(clean_env, monkeypatch):
+    monkeypatch.setenv("KEEP_CANDIDATE_DIRS", "yes")
+    with pytest.raises(RuntimeError, match="invalid_config"):
+        load_settings()
+
+
+def test_env_example_documents_keep_candidate_dirs():
+    content = (Path(__file__).resolve().parent.parent / ".env.example").read_text()
+    assert "KEEP_CANDIDATE_DIRS=false" in content

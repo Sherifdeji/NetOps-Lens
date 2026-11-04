@@ -607,11 +607,12 @@ def test_application_result_uses_tuples_for_collections():
     assert isinstance(result.reasons, tuple)
 
 
-def test_report_has_no_applications_field():
-    # Clarification 1: Report.applications belongs to Phase 4.3, not 4.1.
-    assert "applications" not in Report.model_fields
+def test_report_applications_defaults_to_empty():
+    # Phase 4.3: Report carries per-candidate application results.
+    assert "applications" in Report.model_fields
     report = Report(assessment=AssessmentResult(verdict="NO_REGRESSION_DETECTED"))
-    assert "applications" not in report.model_dump()
+    assert report.applications == []
+    assert report.model_dump()["applications"] == []
 
 
 def test_candidate_patch_rejects_malformed_ids():

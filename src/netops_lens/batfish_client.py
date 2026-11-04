@@ -89,6 +89,11 @@ def _is_generated_candidate_name(name: str) -> bool:
     return _GENERATED_SNAPSHOT_PATTERN.fullmatch(name) is not None
 
 
+def is_candidate_snapshot_name(name: str) -> bool:
+    """Public form of the generated-name check for cross-module guards."""
+    return _is_generated_candidate_name(name)
+
+
 def candidate_snapshot_name(tag: str, candidate_id: str) -> str:
     """Build a ``{tag}-candidate-{candidate_id}`` snapshot name.
 
@@ -216,6 +221,10 @@ class BatfishClient:
         if not _is_generated_candidate_name(name):
             raise BatfishError(f"refusing to register non-candidate snapshot {name!r}")
         self._candidate_snapshots.add(name)
+
+    def is_registered_candidate(self, name: str) -> bool:
+        """Whether this client registered ``name`` as its own candidate snapshot."""
+        return name in self._candidate_snapshots
 
     def delete_snapshot(self, name: str) -> None:
         """Delete one candidate snapshot this run created.

@@ -410,8 +410,12 @@ class VerificationResult(FrozenModel):
     """Immutable per-candidate verification outcome.
 
     ``candidate_snapshot`` is the Batfish snapshot name only, never a
-    filesystem path. ``evidence_ids`` is the deterministic, deduplicated
-    union of the per-check evidence IDs in check order.
+    filesystem path; it is None only when no candidate snapshot was ever
+    successfully created (application or initialization failure). The
+    Phase 4.3 CLI guarantees the name-only form; verify.py double-checks
+    the identity before any tool call. ``evidence_ids`` is the
+    deterministic, deduplicated union of the per-check evidence IDs in
+    check order.
     """
 
     candidate_id: CandidateId
@@ -419,7 +423,7 @@ class VerificationResult(FrozenModel):
     reasons: tuple[str, ...] = ()
     checks: tuple[VerificationCheck, ...] = ()
     evidence_ids: tuple[EvidenceId, ...] = ()
-    candidate_snapshot: str = Field(min_length=1)
+    candidate_snapshot: str | None = Field(default=None)
 
 
 class ToolCallLog(NetOpsModel):
@@ -441,6 +445,7 @@ HumanDecision = Literal["APPROVED", "REJECTED", "PENDING"]
 class Report(NetOpsModel):
     assessment: AssessmentResult
     investigation: InvestigationResult | None = None
+    applications: list[ApplicationResult] = Field(default_factory=list)
     verifications: list[VerificationResult] = Field(default_factory=list)
     human_decision: dict[CandidateId, HumanDecision] = Field(default_factory=dict)
     evidence_index: dict[EvidenceId, EvidenceRecord] = Field(default_factory=dict)
