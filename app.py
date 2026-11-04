@@ -284,7 +284,7 @@ def describe_op(op: PatchOperation) -> str:
         rule = op.expected_rule
         return (
             f"{op.op} {op.node} {op.acl} seq {op.sequence_number} "
-            f"expect {rule.action} {rule.src} {rule.dst} "
+            f"expect {rule.action.value} {rule.src} {rule.dst} "
             f"{rule.protocol} {rule.dst_port}"
         )
     return str(getattr(op, "op", "?"))

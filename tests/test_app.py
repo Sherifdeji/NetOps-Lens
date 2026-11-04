@@ -18,12 +18,17 @@ import pytest
 
 import app
 from netops_lens.models import (
+    AclDeny,
+    AclPermit,
+    AddStaticRoute,
     ApplicationResult,
     AssessmentResult,
     CandidatePatch,
     FileDiff,
     FlowComparison,
     InvestigationResult,
+    RemoveAclLine,
+    RemoveStaticRoute,
     Report,
     ToolCallLog,
     VerificationCheck,
@@ -445,6 +450,77 @@ def test_reject_flow_updates_decision(monkeypatch):
         "c-02": "PENDING",
     }
     assert len(calls) == 1, "rejecting must not rerun the pipeline"
+
+
+@pytest.mark.parametrize(
+    ("op", "expected"),
+    [
+        (
+            AddStaticRoute(
+                op="add_static_route",
+                node="r1",
+                prefix="198.51.100.0/24",
+                next_hop="10.0.12.2",
+            ),
+            "add_static_route r1 198.51.100.0/24 via 10.0.12.2",
+        ),
+        (
+            RemoveStaticRoute(
+                op="remove_static_route",
+                node="r1",
+                prefix="198.51.100.0/24",
+                next_hop="10.0.12.2",
+            ),
+            "remove_static_route r1 198.51.100.0/24 via 10.0.12.2",
+        ),
+        (
+            AclPermit(
+                op="acl_permit",
+                node="r1",
+                acl="DB-FILTER",
+                sequence_number=10,
+                src="192.0.2.0/24",
+                dst="198.51.100.0/24",
+                protocol="tcp",
+                dst_port=1433,
+            ),
+            "acl_permit r1 DB-FILTER seq 10 192.0.2.0/24 198.51.100.0/24 tcp 1433",
+        ),
+        (
+            AclDeny(
+                op="acl_deny",
+                node="r1",
+                acl="DB-FILTER",
+                sequence_number=20,
+                src="192.0.2.0/24",
+                dst="198.51.100.0/24",
+                protocol="tcp",
+                dst_port=22,
+            ),
+            "acl_deny r1 DB-FILTER seq 20 192.0.2.0/24 198.51.100.0/24 tcp 22",
+        ),
+        (
+            RemoveAclLine(
+                op="remove_acl_line",
+                node="r1",
+                acl="DB-FILTER",
+                sequence_number=10,
+                expected_rule={
+                    "action": "deny",
+                    "src": "192.0.2.0/24",
+                    "dst": "198.51.100.0/24",
+                    "protocol": "tcp",
+                    "dst_port": 1433,
+                },
+            ),
+            "remove_acl_line r1 DB-FILTER seq 10 "
+            "expect deny 192.0.2.0/24 198.51.100.0/24 tcp 1433",
+        ),
+    ],
+)
+def test_describe_op_covers_all_variants(op, expected):
+    assert app.describe_op(op) == expected
+    assert "AclAction" not in app.describe_op(op)
 
 
 def test_candidate_diff_text_exact():
