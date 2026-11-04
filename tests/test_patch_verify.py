@@ -633,3 +633,47 @@ def test_keep_failed_dirs_leaves_copy_but_no_path(tmp_path: Path):
     leftover = root / "candidate-c-01"
     assert leftover.is_dir()
     assert (leftover / "configs" / "r1.cfg").read_text() == source_text
+
+
+def test_partial_copytree_failure_cleans_up_only_own_dir(tmp_path: Path, monkeypatch):
+    import netops_lens.patch as patch_module
+
+    src, root = _stage(tmp_path, ACL_PROPOSED)
+    real_copytree = shutil.copytree
+
+    def flaky_copytree(s, d, *args, **kwargs):
+        real_copytree(s, d, *args, **kwargs)
+        (Path(d) / "configs" / "partial.cfg").write_text("half written\n")
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr(patch_module.shutil, "copytree", flaky_copytree)
+    result, path = apply_candidate(
+        _acl_repair_candidate(candidate_id="c-01"), proposed_dir=src, ephemeral_root=root
+    )
+    assert result.applied is False
+    assert path is None
+    assert any("cannot copy proposed snapshot" in reason for reason in result.reasons)
+    # The partial directory created by this attempt is gone.
+    assert not (root / "candidate-c-01").exists()
+    # A retry with the same candidate ID can start cleanly.
+    monkeypatch.undo()
+    retry, retry_path = apply_candidate(
+        _acl_repair_candidate(candidate_id="c-01"), proposed_dir=src, ephemeral_root=root
+    )
+    assert retry.applied is True
+    assert retry_path is not None and retry_path.is_dir()
+
+
+def test_preexisting_candidate_directory_is_never_removed(tmp_path: Path):
+    src, root = _stage(tmp_path, ACL_PROPOSED)
+    squatter = root / "candidate-c-07"
+    squatter.mkdir()
+    sentinel = squatter / "sentinel.txt"
+    sentinel.write_text("do not touch\n")
+    result, path = apply_candidate(
+        _acl_repair_candidate(candidate_id="c-07"), proposed_dir=src, ephemeral_root=root
+    )
+    assert result.applied is False
+    assert path is None
+    assert any("already exists" in reason for reason in result.reasons)
+    assert sentinel.read_text() == "do not touch\n"

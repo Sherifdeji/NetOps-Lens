@@ -623,3 +623,80 @@ def test_candidate_patch_rejects_malformed_ids():
     for bad_id in ("../evil", "c-", "candidate-1"):
         with pytest.raises(ValidationError):
             CandidatePatch.model_validate({**base, "candidate_id": bad_id})
+
+
+def _verification_payload(**overrides):
+    payload = {
+        "candidate_id": "c-01",
+        "status": "VERIFIED",
+        "reasons": [],
+        "checks": [
+            {
+                "name": "candidate_health",
+                "outcome": "pass",
+                "detail": "candidate snapshot 'cand' health OK",
+                "evidence_ids": ["ev-0001"],
+            },
+            {
+                "name": "intent:web",
+                "outcome": "pass",
+                "detail": "candidate REACHABLE satisfies must_reach for flow 'web'",
+                "evidence_ids": ["ev-0002"],
+            },
+        ],
+        "evidence_ids": ["ev-0001", "ev-0002"],
+        "candidate_snapshot": "cand",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_verification_check_construction_and_serialization():
+    from netops_lens.models import VerificationCheck
+
+    check = VerificationCheck(
+        name="no_regression:web",
+        outcome="fail",
+        detail="regression for flow 'web'",
+        evidence_ids=("ev-0002", "ev-0003"),
+    )
+    assert check.name == "no_regression:web"
+    assert check.outcome == "fail"
+    assert check.evidence_ids == ("ev-0002", "ev-0003")
+    restored = VerificationCheck.model_validate(json.loads(check.model_dump_json()))
+    assert restored == check
+
+
+def test_verification_result_round_trip_and_explicit_ids():
+    from netops_lens.models import VerificationResult
+
+    restored = VerificationResult.model_validate(_verification_payload())
+    assert restored.status == "VERIFIED"
+    assert restored.candidate_snapshot == "cand"
+    assert [c.name for c in restored.checks] == ["candidate_health", "intent:web"]
+    assert restored.evidence_ids == ("ev-0001", "ev-0002")
+    assert VerificationResult.model_validate(json.loads(restored.model_dump_json())) == restored
+
+
+def test_verification_result_is_frozen_with_tuple_collections():
+    from netops_lens.models import VerificationResult
+
+    result = VerificationResult.model_validate(_verification_payload())
+    assert isinstance(result.checks, tuple)
+    assert isinstance(result.reasons, tuple)
+    assert isinstance(result.evidence_ids, tuple)
+    with pytest.raises(ValidationError):
+        result.status = "REJECTED"  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        result.checks[0].detail = "rewritten"  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        result.checks.append(object())  # type: ignore[attr-defined]
+
+
+def test_verification_result_preserves_snapshot_name_verbatim():
+    # The model echoes the name it is given; verify.py guarantees that value
+    # is the bare snapshot name (asserted end to end in test_verify.py).
+    from netops_lens.models import VerificationResult
+
+    result = VerificationResult.model_validate(_verification_payload())
+    assert json.loads(result.model_dump_json())["candidate_snapshot"] == "cand"

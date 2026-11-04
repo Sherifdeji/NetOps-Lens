@@ -390,20 +390,35 @@ class ApplicationResult(FrozenModel):
     reasons: tuple[str, ...] = ()
 
 
-class VerificationCheck(NetOpsModel):
+CheckOutcome = Literal["pass", "fail", "unknown"]
+"""Per-check status. Lowercase values are the established contract."""
+
+
+class VerificationCheck(FrozenModel):
+    """One named verification requirement with its supporting evidence."""
+
     name: str = Field(min_length=1)
-    outcome: Literal["pass", "fail", "unknown"]
+    outcome: CheckOutcome
     detail: str = ""
+    evidence_ids: tuple[EvidenceId, ...] = ()
 
 
 VerificationStatus = Literal["VERIFIED", "REJECTED", "UNVERIFIABLE"]
 
 
-class VerificationResult(NetOpsModel):
+class VerificationResult(FrozenModel):
+    """Immutable per-candidate verification outcome.
+
+    ``candidate_snapshot`` is the Batfish snapshot name only, never a
+    filesystem path. ``evidence_ids`` is the deterministic, deduplicated
+    union of the per-check evidence IDs in check order.
+    """
+
     candidate_id: CandidateId
     status: VerificationStatus
-    reasons: list[str] = Field(default_factory=list)
-    checks: list[VerificationCheck] = Field(default_factory=list)
+    reasons: tuple[str, ...] = ()
+    checks: tuple[VerificationCheck, ...] = ()
+    evidence_ids: tuple[EvidenceId, ...] = ()
     candidate_snapshot: str = Field(min_length=1)
 
 

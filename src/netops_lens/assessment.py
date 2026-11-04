@@ -9,6 +9,7 @@ early-exit hook. The verdict is computed by Python alone.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from netops_lens.batfish_client import BatfishClient
 from netops_lens.evidence import EvidenceStore, validate_finding
@@ -26,6 +27,7 @@ from netops_lens.models import (
     Verdict,
 )
 from netops_lens.tools import (
+    DifferentialOutcome,
     check_intent,
     compare_snapshots,
     get_snapshot_health,
@@ -69,6 +71,50 @@ def classify_flow(
     PRE_EXISTING_VIOLATION.
     """
     return _GRID[(kind, baseline_reach, proposed_reach)]
+
+
+@dataclass(frozen=True)
+class DifferentialConsistency:
+    """The differential inputs ``reconcile_flow`` needs beyond dispositions.
+
+    ``reported_changed`` is None when the differential query could not
+    complete; ``consistent`` compares mapped reachability states on both
+    sides, never raw disposition strings.
+    """
+
+    reported_changed: bool | None
+    consistent: bool
+    diff_ok: bool
+    ambiguous: bool
+    ambiguous_detail: str | None
+
+
+def differential_consistency(
+    base_reach: Reachability,
+    prop_reach: Reachability,
+    diff: DifferentialOutcome,
+) -> DifferentialConsistency:
+    """Derive the reconcile inputs from a differential outcome (pure).
+
+    Shared by Stage A and Stage C so both runs apply identical
+    direct-vs-differential consistency semantics.
+    """
+    cross_ok = diff.query_ok and diff.conclusive
+    consistent = cross_ok and (
+        (
+            diff.reported_changed
+            and diff.reference_reach == base_reach
+            and diff.snapshot_reach == prop_reach
+        )
+        or not diff.reported_changed
+    )
+    return DifferentialConsistency(
+        reported_changed=diff.reported_changed if cross_ok else None,
+        consistent=consistent,
+        diff_ok=cross_ok,
+        ambiguous=diff.query_ok and not diff.conclusive,
+        ambiguous_detail=diff.incomplete_reason,
+    )
 
 
 def reconcile_flow(
@@ -217,24 +263,16 @@ def run_mandatory_assessment(
         diff_result, diff_outcome = compare_snapshots(client, store, flow, baseline, proposed)
         base_reach = base_outcome.reachability
         prop_reach = prop_outcome.reachability
-        cross_ok = diff_outcome.query_ok and diff_outcome.conclusive
-        consistent = cross_ok and (
-            (
-                diff_outcome.reported_changed
-                and diff_outcome.reference_reach == base_reach
-                and diff_outcome.snapshot_reach == prop_reach
-            )
-            or not diff_outcome.reported_changed
-        )
+        inputs = differential_consistency(base_reach, prop_reach, diff_outcome)
         classification, discrepancy = reconcile_flow(
             kind,
             base_reach,
             prop_reach,
-            reported_changed=diff_outcome.reported_changed if cross_ok else None,
-            consistent=consistent,
-            diff_ok=cross_ok,
-            ambiguous=diff_outcome.query_ok and not diff_outcome.conclusive,
-            ambiguous_detail=diff_outcome.incomplete_reason,
+            reported_changed=inputs.reported_changed,
+            consistent=inputs.consistent,
+            diff_ok=inputs.diff_ok,
+            ambiguous=inputs.ambiguous,
+            ambiguous_detail=inputs.ambiguous_detail,
         )
         if not health_ok:
             classification = "UNKNOWN"

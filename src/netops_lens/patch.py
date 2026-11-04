@@ -303,9 +303,15 @@ def _create_candidate_copy(
     candidate_dir = raw_candidate.resolve()
     if candidate_dir == root or root not in candidate_dir.parents:
         raise _PatchFailure("candidate directory escapes ephemeral root")
+    already_there = os.path.lexists(raw_candidate)
     try:
         shutil.copytree(proposed, candidate_dir)
     except OSError:
+        # Pre-existing paths are refused above, so a directory present here
+        # was created by this attempt: remove only that partial copy, never
+        # a directory that predates this call.
+        if not already_there and os.path.lexists(candidate_dir):
+            shutil.rmtree(candidate_dir, ignore_errors=True)
         raise _PatchFailure("cannot copy proposed snapshot") from None
     return candidate_dir
 

@@ -12,6 +12,7 @@ import pytest
 from netops_lens.assessment import (
     classify_flow,
     decide_verdict,
+    differential_consistency,
     reconcile_flow,
     run_mandatory_assessment,
 )
@@ -426,3 +427,121 @@ def test_split_denied_family_regression_end_to_end():
                 if isinstance(t, dict) and t.get("disposition")
             )
     assert {"ACCEPTED", "DENIED_IN", "DENIED_OUT"} <= raws
+
+
+def _consistency_inputs(base, prop, **diff_kwargs):
+    from netops_lens.tools import DifferentialOutcome
+
+    defaults = {
+        "reported_changed": False,
+        "snapshot_reach": None,
+        "reference_reach": None,
+        "snapshot_trace_total": 0,
+        "reference_trace_total": 0,
+        "query_ok": True,
+        "conclusive": True,
+    }
+    defaults.update(diff_kwargs)
+    return differential_consistency(base, prop, DifferentialOutcome(**defaults))
+
+
+def test_differential_consistency_matrix():
+    # Changed + corroborated.
+    inputs = _consistency_inputs(
+        "REACHABLE", "UNREACHABLE",
+        reported_changed=True, snapshot_reach="UNREACHABLE", reference_reach="REACHABLE",
+    )
+    assert (inputs.diff_ok, inputs.consistent, inputs.reported_changed) == (True, True, True)
+    assert (inputs.ambiguous, inputs.ambiguous_detail) == (False, None)
+    # Changed + uncorroborated (empty differential): consistency holds
+    # vacuously, but reported_changed=False still forces UNKNOWN downstream.
+    inputs = _consistency_inputs("REACHABLE", "UNREACHABLE")
+    assert (inputs.diff_ok, inputs.consistent, inputs.reported_changed) == (True, True, False)
+    # Changed + inconsistent differential.
+    inputs = _consistency_inputs(
+        "REACHABLE", "UNREACHABLE",
+        reported_changed=True, snapshot_reach="UNREACHABLE", reference_reach="UNREACHABLE",
+    )
+    assert (inputs.diff_ok, inputs.consistent) == (True, False)
+    # Unchanged + empty differential.
+    inputs = _consistency_inputs("REACHABLE", "REACHABLE")
+    assert (inputs.diff_ok, inputs.consistent, inputs.reported_changed) == (True, True, False)
+    # Unchanged + conflicting differential report.
+    inputs = _consistency_inputs(
+        "REACHABLE", "REACHABLE",
+        reported_changed=True, snapshot_reach="REACHABLE", reference_reach="UNREACHABLE",
+    )
+    assert (inputs.diff_ok, inputs.consistent) == (True, False)
+    # Query failed: nothing reported, nothing consistent.
+    inputs = _consistency_inputs(
+        "REACHABLE", "UNREACHABLE", query_ok=False, conclusive=False,
+        incomplete_reason="boom",
+    )
+    assert inputs.diff_ok is False
+    assert inputs.consistent is False
+    assert inputs.reported_changed is None
+    assert (inputs.ambiguous, inputs.ambiguous_detail) == (False, "boom")
+    # Truncated: query ok but inconclusive.
+    inputs = _consistency_inputs(
+        "REACHABLE", "UNREACHABLE", conclusive=False, incomplete_reason="truncated",
+    )
+    assert inputs.diff_ok is False
+    assert inputs.consistent is False
+    assert inputs.ambiguous is True
+
+
+def _run_one_flow_verdict(base_disp, prop_disp, diff_rows):
+    intent = Intent(
+        version=1,
+        must_reach=[
+            {
+                "flow_id": "reach-icmp",
+                "src_ip": "192.0.2.10",
+                "dst_ip": "198.51.100.1",
+                "protocol": "ICMP",
+                "start_location": "@enter(r1[GigabitEthernet0/1])",
+            }
+        ],
+    )
+    answers = {
+        ("traceroute", "base"): [trace_row(base_disp)],
+        ("traceroute", "prop"): [trace_row(prop_disp)],
+        ("differentialReachability", "prop"): diff_rows,
+    }
+    client = FakeClient(answers=answers)
+    return run_mandatory_assessment(client, EvidenceStore(), BASE, PROP, intent)
+
+
+def test_stage_a_behavior_preserved_across_helper_extraction():
+    # No change anywhere: NO_CHANGE_OK on the single flow, verdict follows.
+    result = _run_one_flow_verdict("ACCEPTED", "ACCEPTED", [])
+    assert [c.classification for c in result.flow_comparisons] == ["NO_CHANGE_OK"]
+    assert result.verdict == "NO_REGRESSION_DETECTED"
+    # Confirmed regression with corroboration.
+    diff = [differential_row("NO_ROUTE", "ACCEPTED")]
+    result = _run_one_flow_verdict("ACCEPTED", "NO_ROUTE", diff)
+    assert [c.classification for c in result.flow_comparisons] == ["REGRESSION"]
+    assert result.verdict == "REGRESSION_DETECTED"
+    # Unknown direct reachability.
+    diff = [differential_row("NO_ROUTE", "ACCEPTED")]
+    result = _run_one_flow_verdict("ACCEPTED", "UNKNOWN-ZZZ", diff)
+    assert [c.classification for c in result.flow_comparisons] == ["UNKNOWN"]
+    assert result.verdict == "INCONCLUSIVE"
+    # Incomplete differential with a real change.
+    result = _run_one_flow_verdict(
+        "ACCEPTED", "NO_ROUTE",
+        [multi_differential_row(["NO_ROUTE"], ["ACCEPTED"], snapshot_total=12, reference_total=1)],
+    )
+    assert [c.classification for c in result.flow_comparisons] == ["UNKNOWN"]
+    assert result.verdict == "INCONCLUSIVE"
+    # Direct/differential contradiction on an unchanged flow.
+    result = _run_one_flow_verdict(
+        "ACCEPTED", "ACCEPTED", [differential_row("ACCEPTED", "NO_ROUTE")]
+    )
+    assert [c.classification for c in result.flow_comparisons] == ["UNKNOWN"]
+    assert result.verdict == "INCONCLUSIVE"
+    # Pre-existing violation only.
+    diff = [differential_row("NO_ROUTE", "NO_ROUTE")]
+    result = _run_one_flow_verdict("NO_ROUTE", "NO_ROUTE", diff)
+    assert [c.classification for c in result.flow_comparisons] == ["PRE_EXISTING_VIOLATION"]
+    assert result.verdict == "INCONCLUSIVE"
