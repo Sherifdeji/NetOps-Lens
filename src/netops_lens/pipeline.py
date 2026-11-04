@@ -15,6 +15,7 @@ from __future__ import annotations
 import shutil
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -81,6 +82,43 @@ class PipelineConnectionError(BatfishError):
 # CLI forwards its own module global so existing ``run_stage_b`` patches
 # keep working, and tests may inject scripted variants.
 StageBFn = Callable[..., InvestigationResult]
+
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    """One live stage-progress signal for a UI observer (e.g. Streamlit).
+
+    This is a transient callback payload, not report data: it is never
+    stored, serialized, or imported by any UI module. Only the documented
+    stage/status values are ever emitted.
+    """
+
+    stage: str  # "stage_a" | "stage_b" | "stage_c" | "stage_c_candidate"
+    status: str  # "started" | "completed" | "skipped"
+    detail: str = ""
+
+
+# UI progress observer: receives ProgressEvents while the pipeline runs.
+# The pipeline never imports Streamlit; the UI adapts this to st.status.
+ProgressCallback = Callable[[ProgressEvent], None]
+
+
+def _emit(
+    on_progress: ProgressCallback | None,
+    warn: Callable[[str], None],
+    event: ProgressEvent,
+) -> None:
+    """Deliver one progress event without ever disturbing the assessment.
+
+    A raising observer must not fail, alter, or abort the run: the failure
+    is forwarded to the warning handler and the pipeline continues.
+    """
+    if on_progress is None:
+        return
+    try:
+        on_progress(event)
+    except Exception as exc:
+        warn(f"progress callback failed: {type(exc).__name__}: {exc}")
 
 
 def load_manifest(path: str | Path) -> dict:
@@ -363,11 +401,14 @@ def run_stage_c(
     proposed_dir: Path,
     tag: str,
     warn: Callable[[str], None],
+    on_progress: ProgressCallback | None = None,
 ) -> tuple[list[ApplicationResult], list[VerificationResult]]:
     """Apply and verify every submitted candidate independently.
 
     Candidates never share directories or snapshots; one candidate's
-    failure never prevents later candidates from being evaluated.
+    failure never prevents later candidates from being evaluated. After
+    each candidate is processed, a ``stage_c_candidate`` / ``completed``
+    progress event is emitted (a no-op when no callback is supplied).
     """
     applications: list[ApplicationResult] = []
     verifications: list[VerificationResult] = []
@@ -381,7 +422,17 @@ def run_stage_c(
                     candidate_id=candidate.candidate_id, applied=False, reasons=(reason,)
                 )
             )
-            verifications.append(empty_skeleton(candidate.candidate_id, None, intent, reason))
+            verification = empty_skeleton(candidate.candidate_id, None, intent, reason)
+            verifications.append(verification)
+            _emit(
+                on_progress,
+                warn,
+                ProgressEvent(
+                    stage="stage_c_candidate",
+                    status="completed",
+                    detail=f"{candidate.candidate_id}: {verification.status}",
+                ),
+            )
         return applications, verifications
     for candidate in investigation.candidates:
         try:
@@ -407,6 +458,15 @@ def run_stage_c(
             verification = empty_skeleton(candidate.candidate_id, None, intent, detail)
         applications.append(app_result)
         verifications.append(verification)
+        _emit(
+            on_progress,
+            warn,
+            ProgressEvent(
+                stage="stage_c_candidate",
+                status="completed",
+                detail=f"{candidate.candidate_id}: {verification.status}",
+            ),
+        )
     if not settings.keep_candidate_dirs:
         _remove_empty_run_root(root, warn)
     return applications, verifications
@@ -420,6 +480,7 @@ def run_assessment_pipeline(
     client_factory: Callable[[str, str], BatfishClient] | None = None,
     stage_b: StageBFn | None = None,
     on_warning: Callable[[str], None] | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> Report:
     """Run Stage A -> Stage B -> Stage C and return the complete report.
 
@@ -437,7 +498,9 @@ def run_assessment_pipeline(
     failures. Resource cleanup (candidate snapshots, candidate
     directories, the run-scoped network) runs in ``finally`` blocks on
     every path. ``on_warning`` receives best-effort cleanup warnings; by
-    default they are dropped so library use stays silent.
+    default they are dropped so library use stays silent. ``on_progress``
+    receives live stage-progress events for a UI observer; when omitted
+    (the default) nothing is emitted and behavior is unchanged.
     """
     resolved = settings if settings is not None else load_settings()
     # Silent by default: a library/Streamlit caller must opt in to warnings.
@@ -459,14 +522,37 @@ def run_assessment_pipeline(
         client.init_snapshot(baseline_dir, baseline_ref.name)
         client.init_snapshot(proposed_dir, proposed_ref.name)
         store = EvidenceStore()
+        _emit(on_progress, warn, ProgressEvent(stage="stage_a", status="started"))
         assessment = run_mandatory_assessment(
             client, store, baseline_ref, proposed_ref, intent
         )
+        _emit(
+            on_progress,
+            warn,
+            ProgressEvent(
+                stage="stage_a", status="completed", detail=assessment.verdict
+            ),
+        )
         if request.no_investigate:
             investigation = None
+            _emit(
+                on_progress,
+                warn,
+                ProgressEvent(
+                    stage="stage_b", status="skipped", detail="no_investigate"
+                ),
+            )
+            _emit(
+                on_progress,
+                warn,
+                ProgressEvent(
+                    stage="stage_c", status="skipped", detail="no_investigate"
+                ),
+            )
         else:
             # Stage B runs while the run-scoped network is still alive;
             # it never raises and never mutates the Stage A assessment.
+            _emit(on_progress, warn, ProgressEvent(stage="stage_b", status="started"))
             investigation = run_stage_b_fn(
                 client,
                 store,
@@ -478,12 +564,33 @@ def run_assessment_pipeline(
                 settings=resolved,
                 transport=transport,
             )
+            _emit(
+                on_progress,
+                warn,
+                ProgressEvent(
+                    stage="stage_b",
+                    status="completed",
+                    detail=(
+                        f"{len(investigation.tool_activity)} tool call(s), "
+                        f"{len(investigation.candidates)} candidate(s)"
+                    ),
+                ),
+            )
         applications: list[ApplicationResult] = []
         verifications: list[VerificationResult] = []
         if _stage_c_should_run(
             assessment, investigation, no_investigate=request.no_investigate
         ):
             assert investigation is not None
+            _emit(
+                on_progress,
+                warn,
+                ProgressEvent(
+                    stage="stage_c",
+                    status="started",
+                    detail=f"{len(investigation.candidates)} candidate(s)",
+                ),
+            )
             applications, verifications = run_stage_c(
                 client=client,
                 store=store,
@@ -496,6 +603,29 @@ def run_assessment_pipeline(
                 proposed_dir=proposed_dir,
                 tag=tag,
                 warn=warn,
+                on_progress=on_progress,
+            )
+            _emit(
+                on_progress,
+                warn,
+                ProgressEvent(
+                    stage="stage_c",
+                    status="completed",
+                    detail=f"{len(applications)} candidate(s) processed",
+                ),
+            )
+        elif not request.no_investigate:
+            assert investigation is not None
+            if not investigation.candidates:
+                skip_reason = "no candidates"
+            else:
+                skip_reason = "verdict not REGRESSION_DETECTED"
+            _emit(
+                on_progress,
+                warn,
+                ProgressEvent(
+                    stage="stage_c", status="skipped", detail=skip_reason
+                ),
             )
         decisions: dict[str, HumanDecision] = {
             app.candidate_id: "PENDING" for app in applications

@@ -495,3 +495,155 @@ def test_cli_missing_intent_exit_code(tmp_path, capsys):
     ]
     assert cli.run_assess(cli.build_parser().parse_args(argv)) == 1
     assert "input error" in capsys.readouterr().err
+
+
+# --- optional progress callback ---------------------------------------------
+
+
+def _progress_events(tmp_path, fake, candidates, **kw) -> tuple:
+    from netops_lens.pipeline import ProgressEvent
+
+    events: list[ProgressEvent] = []
+    report = _run_pipeline(
+        tmp_path, fake, candidates, on_progress=events.append, **kw
+    )
+    return report, [(e.stage, e.status) for e in events], events
+
+
+def _verified_answers(tag: str, candidate_id: str = "c-01") -> dict:
+    snap = _cand_name(tag, candidate_id)
+    answers = dict(_stage_a_answers(tag))
+    answers[("traceroute", snap)] = [trace_row("ACCEPTED")]
+    answers[("differentialReachability", snap)] = [differential_row("ACCEPTED", "ACCEPTED")]
+    return answers
+
+
+def test_progress_events_happy_path_order(tmp_path):
+    fake = PipeFake(answers=_verified_answers("manual"))
+    report, pairs, events = _progress_events(tmp_path, fake, [_route_candidate()])
+    assert pairs == [
+        ("stage_a", "started"),
+        ("stage_a", "completed"),
+        ("stage_b", "started"),
+        ("stage_b", "completed"),
+        ("stage_c", "started"),
+        ("stage_c_candidate", "completed"),
+        ("stage_c", "completed"),
+    ]
+    assert events[1].detail == "REGRESSION_DETECTED"
+    # Counts only: the "test" narrative text must not leak into the detail.
+    assert events[3].detail == "0 tool call(s), 1 candidate(s)"
+    assert events[4].detail == "1 candidate(s)"
+    assert events[5].detail == "c-01: VERIFIED"
+    assert events[6].detail == "1 candidate(s) processed"
+    assert report.verifications[0].status == "VERIFIED"
+
+
+def test_progress_no_investigate_skips_b_and_c(tmp_path, capsys):
+    fake = PipeFake(answers=_stage_a_answers("manual"))
+    base, prop, intent = _write_tree(tmp_path / "case")
+    events: list = []
+    report = run_assessment_pipeline(
+        _request(base, prop, intent, no_investigate=True),
+        settings=_settings(),
+        stage_b=_canned([_route_candidate()]),
+        client_factory=lambda host, network: fake,
+        on_progress=events.append,
+    )
+    assert [(e.stage, e.status) for e in events] == [
+        ("stage_a", "started"),
+        ("stage_a", "completed"),
+        ("stage_b", "skipped"),
+        ("stage_c", "skipped"),
+    ]
+    assert all(e.detail == "no_investigate" for e in events[2:])
+    assert report.investigation is None
+    assert capsys.readouterr().err == ""
+
+
+def test_progress_stage_c_skipped_without_candidates(tmp_path):
+    fake = PipeFake(answers=_stage_a_answers("manual"))
+    report, pairs, events = _progress_events(tmp_path, fake, [])
+    assert report.assessment.verdict == "REGRESSION_DETECTED"
+    assert pairs == [
+        ("stage_a", "started"),
+        ("stage_a", "completed"),
+        ("stage_b", "started"),
+        ("stage_b", "completed"),
+        ("stage_c", "skipped"),
+    ]
+    assert events[-1].detail == "no candidates"
+    assert [p for p in pairs if p[0] == "stage_c"] == [("stage_c", "skipped")]
+    assert report.applications == [] and report.verifications == []
+
+
+def test_progress_callback_failure_does_not_break_run(tmp_path):
+    warnings: list[str] = []
+
+    def _boom(event):
+        raise RuntimeError("observer is down")
+
+    fake = PipeFake(answers=_verified_answers("manual"))
+    report = _run_pipeline(
+        tmp_path,
+        fake,
+        [_route_candidate()],
+        on_progress=_boom,
+        on_warning=warnings.append,
+    )
+    assert report.verifications[0].status == "VERIFIED"
+    assert report.human_decision == {"c-01": "PENDING"}
+    assert warnings, "callback failures must reach the warning handler"
+    assert all("progress callback failed" in w for w in warnings)
+
+
+def test_progress_default_none_is_silent_noop(tmp_path, capsys):
+    fake = PipeFake(answers=_verified_answers("manual"))
+    report = _run_pipeline(tmp_path, fake, [_route_candidate()])
+    assert report.verifications[0].status == "VERIFIED"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_progress_candidate_events_on_ephemeral_root_failure(tmp_path, monkeypatch):
+    from netops_lens import pipeline as pipeline_module
+    from netops_lens.evidence import EvidenceStore
+    from netops_lens.intent import load_intent
+    from netops_lens.models import SnapshotRef
+
+    def _boom(tag):
+        raise OSError("disk read-only")
+
+    monkeypatch.setattr(pipeline_module, "_ephemeral_root", _boom)
+    base, prop, intent_path = _write_tree(tmp_path / "case")
+    investigation = InvestigationResult(
+        narrative="test",
+        candidates=[_route_candidate("c-01"), _route_candidate("c-02")],
+        tool_activity=[],
+    )
+    events: list = []
+    applications, verifications = pipeline_module.run_stage_c(
+        client=PipeFake(),
+        store=EvidenceStore(),
+        settings=_settings(),
+        assessment=AssessmentResult(verdict="REGRESSION_DETECTED"),
+        investigation=investigation,
+        intent=load_intent(intent_path),
+        baseline_ref=SnapshotRef(name="manual-baseline", path=str(base)),
+        proposed_ref=SnapshotRef(name="manual-proposed", path=str(prop)),
+        proposed_dir=prop,
+        tag="manual",
+        warn=lambda _m: None,
+        on_progress=events.append,
+    )
+    assert [(e.stage, e.status) for e in events] == [
+        ("stage_c_candidate", "completed"),
+        ("stage_c_candidate", "completed"),
+    ]
+    assert [e.detail for e in events] == ["c-01: UNVERIFIABLE", "c-02: UNVERIFIABLE"]
+    assert [a.candidate_id for a in applications] == ["c-01", "c-02"]
+    assert [a.applied for a in applications] == [False, False]
+    assert all("ephemeral root" in "; ".join(a.reasons) for a in applications)
+    assert [v.candidate_id for v in verifications] == ["c-01", "c-02"]
+    assert [v.status for v in verifications] == ["UNVERIFIABLE", "UNVERIFIABLE"]
