@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from netops_lens import cli
+from netops_lens import cli, pipeline
 
 
 def test_run_network_names_are_unique_and_safe():
@@ -159,12 +159,18 @@ def test_run_assess_deletes_network_on_success(monkeypatch, tmp_path, capsys):
         return SimpleNamespace(verdict="NO_REGRESSION_DETECTED")
 
     class FakeReport:
+        applications: list = []
+        investigation = None
+
+        def __init__(self):
+            self.assessment = SimpleNamespace(verdict="NO_REGRESSION_DETECTED")
+
         def model_dump_json(self, **kwargs):
             return '{"verdict": "NO_REGRESSION_DETECTED"}'
 
     monkeypatch.setattr(cli, "BatfishClient", FakeClient)
-    monkeypatch.setattr(cli, "run_mandatory_assessment", fake_assessment)
-    monkeypatch.setattr(cli, "assemble_report", lambda *a, **k: FakeReport())
+    monkeypatch.setattr(pipeline, "run_mandatory_assessment", fake_assessment)
+    monkeypatch.setattr(pipeline, "assemble_report", lambda *a, **k: FakeReport())
     args = _parse(tmp_path)
     args.json = True
     assert cli.run_assess(args) == 0
@@ -202,12 +208,18 @@ def test_run_assess_uses_configured_prefix(monkeypatch, tmp_path):
         return SimpleNamespace(verdict="NO_REGRESSION_DETECTED")
 
     class FakeReport:
+        applications: list = []
+        investigation = None
+
+        def __init__(self):
+            self.assessment = SimpleNamespace(verdict="NO_REGRESSION_DETECTED")
+
         def model_dump_json(self, **kwargs):
             return "{}"
 
     monkeypatch.setattr(cli, "BatfishClient", FakeClient)
-    monkeypatch.setattr(cli, "run_mandatory_assessment", fake_assessment)
-    monkeypatch.setattr(cli, "assemble_report", lambda *a, **k: FakeReport())
+    monkeypatch.setattr(pipeline, "run_mandatory_assessment", fake_assessment)
+    monkeypatch.setattr(pipeline, "assemble_report", lambda *a, **k: FakeReport())
     args = _parse(tmp_path)
     args.json = True
     assert cli.run_assess(args) == 0

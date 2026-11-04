@@ -23,7 +23,7 @@ from netops_lens.models import (
     SnapshotRef,
 )
 from netops_lens.tools import get_acl_rules, get_routes
-from tests._fakes import FakeClient, trace_row
+from tests._fakes import FakeClient, flow_dict, trace_row
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 START = "@enter(r1[GigabitEthernet0/1])"
@@ -385,45 +385,40 @@ def _acl_submit(rule10: dict, *, sequence: int = 10, expected: dict | None = Non
 
 
 def test_guessed_acl_sequence_rejected():
-    store = EvidenceStore()
-    rules = _seed_acl(store)
-    _seed_trace(store)
-    rule10 = next(r for r in rules if r["sequence_number"] == 10)
-    script = [
-        _resp(_call("submit_candidate_patch", _acl_submit(rule10, sequence=99), call_id="call-1")),
-        _resp(content="stopped"),
-    ]
-    result, transport, _ = _run(script, store=store)
+    rule10 = next(r for r in _probe_acl_rules() if r["sequence_number"] == 10)
+    client = _acl_client(
+        [_denied_trace(_fdb_flow())],
+        [{"Action": "DENY", "Line_Content": DENY_1433}],
+    )
+    script = _acl_script(_acl_submit(rule10, sequence=99))
+    result, transport, _ = _acl_run_proposed(script, client)
     assert "never guess sequences" in _tool_text(transport)
     assert result.candidates == []
 
 
 def test_unmatched_expected_rule_rejected():
-    store = EvidenceStore()
-    rules = _seed_acl(store)
-    _seed_trace(store)
-    rule10 = next(r for r in rules if r["sequence_number"] == 10)
+    rule10 = next(r for r in _probe_acl_rules() if r["sequence_number"] == 10)
     wrong = dict(_rule_body(rule10))
     wrong["action"] = "permit"
-    script = [
-        _resp(_call("submit_candidate_patch", _acl_submit(rule10, expected=wrong))),
-        _resp(content="stopped"),
-    ]
-    result, transport, _ = _run(script, store=store)
+    client = _acl_client(
+        [_denied_trace(_fdb_flow())],
+        [{"Action": "DENY", "Line_Content": DENY_1433}],
+    )
+    script = _acl_script(_acl_submit(rule10, expected=wrong))
+    result, transport, _ = _acl_run_proposed(script, client)
     assert "expected_rule does not match" in _tool_text(transport)
     assert result.candidates == []
 
 
 def test_valid_acl_repair_accepted():
-    store = EvidenceStore()
-    rules = _seed_acl(store)
-    _seed_trace(store)
-    rule10 = next(r for r in rules if r["sequence_number"] == 10)
-    script = [
-        _resp(_call("submit_candidate_patch", _acl_submit(rule10))),
-        _resp(content="ACL repaired as c-01."),
-    ]
-    result, _, _ = _run(script, store=store)
+    rule10 = next(r for r in _probe_acl_rules() if r["sequence_number"] == 10)
+    client = _acl_client(
+        [_denied_trace(_fdb_flow())],
+        [{"Action": "DENY", "Line_Content": DENY_1433}],
+    )
+    script = _acl_script(_acl_submit(rule10))
+    script[-1] = _resp(content="ACL repaired as c-01.")
+    result, _, _ = _acl_run_proposed(script, client)
     assert len(result.candidates) == 1
     candidate = result.candidates[0]
     assert candidate.candidate_id == "c-01"
@@ -464,29 +459,31 @@ def test_unguessed_route_rejected_without_evidence():
 
 
 def test_retry_then_accept():
-    store = EvidenceStore()
-    _seed_routes(store)
+    # F-12: the retry succeeds because the evidence arrives in-run between
+    # the two submissions, not because anything predates the invocation.
     script = [
         _resp(_call("submit_candidate_patch", _route_submit(prefix="10.9.9.0/24"))),
+        _resp(_call("get_routes", {"snapshot": "baseline", "node": "r1"})),
         _resp(_call("submit_candidate_patch", _route_submit(), call_id="call-2")),
         _resp(content="fixed on retry"),
     ]
-    result, _, _ = _run(script, store=store)
+    client = FakeClient(answers={("routes", "base"): [dict(ROUTE_ROW)]})
+    result, _, _ = _run(script, client=client)
     assert len(result.candidates) == 1
     assert result.candidates[0].candidate_id == "c-01"
     assert result.narrative == "fixed on retry"
 
 
 def test_max_candidates_enforced():
-    store = EvidenceStore()
-    _seed_routes(store)
     script = [
+        _resp(_call("get_routes", {"snapshot": "baseline", "node": "r1"})),
         _resp(_call("submit_candidate_patch", _route_submit(), call_id="call-1")),
         _resp(_call("submit_candidate_patch", _route_submit(), call_id="call-2")),
         _resp(content="done"),
     ]
     settings = Settings(max_candidates=1)
-    result, transport, _ = _run(script, store=store, settings=settings)
+    client = FakeClient(answers={("routes", "base"): [dict(ROUTE_ROW)]})
+    result, transport, _ = _run(script, settings=settings, client=client)
     assert len(result.candidates) == 1
     assert "candidate budget exhausted" in _tool_text(transport)
 
@@ -685,6 +682,89 @@ def _submit(args: dict) -> list[dict]:
     return [_resp(_call("submit_candidate_patch", args)), _resp(content="stopped")]
 
 
+# --- F-12: in-run evidence helpers --------------------------------------
+#
+# Since the Stage B evidence boundary, only records minted by tool calls
+# inside the current Stage B invocation can authorize a candidate. These
+# helpers build scripted transports that mint that evidence in-run (plus
+# the canned Batfish answers behind it) instead of pre-seeding the store.
+
+DENY_1433 = "10 deny tcp 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255 eq 1433"
+DENY_22 = "20 deny tcp 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255 eq 22"
+
+
+def _denied_trace(flow: dict, *, node: str = "r1", acl: str = "DB-FILTER") -> dict:
+    """One unanimous DENIED_IN traceroute row whose hop names an ACL filter."""
+    hops = [{"node": node, "steps": [{"action": "DENIED", "detail": {"filter": acl}}]}]
+    return trace_row("DENIED_IN", hops=hops, flow=flow)
+
+
+def _fdb_flow() -> dict:
+    """Canned Flow identity matching the f-db FlowSpec (TCP/1433)."""
+    return flow_dict(proto="TCP", dport=1433)
+
+
+def _fblock_flow() -> dict:
+    """Canned Flow identity matching the f-block FlowSpec (TCP/22)."""
+    return flow_dict(proto="TCP", dport=22)
+
+
+def _probe_acl_rules() -> list[dict]:
+    """Read the proposed-fixture ACL rules without touching the run store."""
+    return _seed_acl(EvidenceStore())
+
+
+def _acl_client(trace_rows: list[dict], filter_rows: list[dict]) -> FakeClient:
+    return FakeClient(
+        answers={
+            ("traceroute", "prop"): trace_rows,
+            ("testFilters", "prop"): filter_rows,
+        }
+    )
+
+
+def _acl_script(
+    submit_args: dict,
+    *,
+    trace_flow_ids: tuple[str, ...] = ("f-db",),
+) -> list[dict]:
+    """Mint proposed ACL inventory + trace attribution in-run, then submit.
+
+    The hop/filter content behind the trace calls comes from the canned
+    client answers (built with :func:`_denied_trace`); the script only
+    orders the in-run tool calls.
+    """
+    script = [
+        _resp(
+            _call(
+                "get_acl_rules",
+                {"snapshot": "proposed", "node": "r1", "acl": "DB-FILTER"},
+            )
+        )
+    ]
+    for flow_id in trace_flow_ids:
+        script.append(
+            _resp(_call("trace_flow", {"flow_id": flow_id, "snapshot": "proposed"}))
+        )
+    script.append(_resp(_call("submit_candidate_patch", submit_args)))
+    script.append(_resp(content="stopped"))
+    return script
+
+
+def _route_script(submit_args: dict, *, snapshot: str = "baseline") -> list[dict]:
+    """Mint a get_routes record in-run, then submit."""
+    return [
+        _resp(_call("get_routes", {"snapshot": snapshot, "node": "r1"})),
+        _resp(_call("submit_candidate_patch", submit_args)),
+        _resp(content="stopped"),
+    ]
+
+
+def _acl_run_proposed(script: list[dict], client: FakeClient) -> tuple:
+    """Run a script against the real proposed ACL fixture snapshot."""
+    return _run(script, client=client, proposed=ACL_PROP_SNAP)
+
+
 # --- F-01: snapshot-scoped evidence ------------------------------------
 
 
@@ -703,18 +783,26 @@ def test_baseline_only_acl_evidence_cannot_authorize_removal():
 
 
 def test_acl_evidence_insertion_order_does_not_change_acceptance():
-    rules_prop: list[dict] = []
-    for order in ("proposed-first", "baseline-first"):
-        store = EvidenceStore()
-        if order == "proposed-first":
-            rules_prop = _seed_acl(store)
-            _seed_baseline_acl(store)
-        else:
-            _seed_baseline_acl(store)
-            rules_prop = _seed_acl(store)
-        _seed_trace(store)
-        rule10 = next(r for r in rules_prop if r["sequence_number"] == 10)
-        result, _, _ = _run(_submit(_acl_submit(rule10)), store=store)
+    # F-12: evidence arrival order within the run (inventory before trace
+    # or trace before inventory) does not change acceptance.
+    rule10 = next(r for r in _probe_acl_rules() if r["sequence_number"] == 10)
+    for order in ("acl-first", "trace-first"):
+        script = []
+        trace = _resp(_call("trace_flow", {"flow_id": "f-db", "snapshot": "proposed"}))
+        inventory = _resp(
+            _call(
+                "get_acl_rules",
+                {"snapshot": "proposed", "node": "r1", "acl": "DB-FILTER"},
+            )
+        )
+        script.extend([inventory, trace] if order == "acl-first" else [trace, inventory])
+        script.append(_resp(_call("submit_candidate_patch", _acl_submit(rule10))))
+        script.append(_resp(content="stopped"))
+        client = _acl_client(
+            [_denied_trace(_fdb_flow())],
+            [{"Action": "DENY", "Line_Content": DENY_1433}],
+        )
+        result, _, _ = _acl_run_proposed(script, client)
         assert result.candidates and result.candidates[0].candidate_id == "c-01", order
 
 
@@ -755,8 +843,6 @@ def test_unrelated_run_evidence_cannot_authorize_candidate():
 
 
 def test_valid_remove_static_route_accepted():
-    store = EvidenceStore()
-    _seed_proposed_routes(store)
     args = {
         "rationale": "remove the evidenced proposed route",
         "operations": [
@@ -769,7 +855,8 @@ def test_valid_remove_static_route_accepted():
         ],
         "target_flow_ids": ["f-db"],
     }
-    result, _, _ = _run(_submit(args), store=store)
+    client = FakeClient(answers={("routes", "prop"): [dict(ROUTE_ROW)]})
+    result, _, _ = _run(_route_script(args, snapshot="proposed"), client=client)
     assert len(result.candidates) == 1
     assert result.candidates[0].candidate_id == "c-01"
 
@@ -777,20 +864,14 @@ def test_valid_remove_static_route_accepted():
 # --- F-03: route-to-flow binding ----------------------------------------
 
 
-def _seed_extra_prefix(store: EvidenceStore) -> None:
+def test_unrelated_prefix_rejected_despite_matching_hop():
     rows = [
         dict(ROUTE_ROW),
         {"Network": "10.99.0.0/24", "Protocol": "static", "Next_Hop": {"ip": "10.0.12.2"}},
     ]
     client = FakeClient(answers={("routes", "base"): rows})
-    result = get_routes(client, store, BASE, "r1")
-    assert result.details["route_found"] is True
-
-
-def test_unrelated_prefix_rejected_despite_matching_hop():
-    store = EvidenceStore()
-    _seed_extra_prefix(store)
-    result, transport, _ = _run(_submit(_route_submit(prefix="10.99.0.0/24")), store=store)
+    script = _route_script(_route_submit(prefix="10.99.0.0/24"))
+    result, transport, _ = _run(script, client=client)
     assert "covers the destination of no target flow" in _tool_text(transport)
     assert result.candidates == []
 
@@ -948,12 +1029,13 @@ def test_extra_operation_outside_repair_shape_rejected():
 
 
 def test_removal_of_nonexistent_rule_rejected():
-    store = EvidenceStore()
-    rules = _seed_acl(store)
-    _seed_trace(store)
-    rule10 = next(r for r in rules if r["sequence_number"] == 10)
-    args = _acl_submit(rule10, sequence=99)
-    result, transport, _ = _run(_submit(args), store=store)
+    rule10 = next(r for r in _probe_acl_rules() if r["sequence_number"] == 10)
+    client = _acl_client(
+        [_denied_trace(_fdb_flow())],
+        [{"Action": "DENY", "Line_Content": DENY_1433}],
+    )
+    script = _acl_script(_acl_submit(rule10, sequence=99))
+    result, transport, _ = _acl_run_proposed(script, client)
     assert "is not evidenced" in _tool_text(transport)
     assert result.candidates == []
 
@@ -966,14 +1048,15 @@ def test_unrelated_target_flow_attribution_does_not_veto_valid_repair():
     # targeted) uniquely attributes a different rule. The f-db repair
     # must still be accepted: unrelated attributions neither support
     # nor veto it.
-    store = EvidenceStore()
-    rules = _seed_acl(store)
-    rule10 = next(r for r in rules if r["sequence_number"] == 10)
-    _seed_trace(store)
-    _seed_trace(store, flow_id="f-block", sequence=20)
+    rule10 = next(r for r in _probe_acl_rules() if r["sequence_number"] == 10)
     args = _acl_submit(rule10)
     args["target_flow_ids"] = ["f-db", "f-block"]
-    result, _, _ = _run(_submit(args), store=store)
+    client = _acl_client(
+        [_denied_trace(_fdb_flow()), _denied_trace(_fblock_flow())],
+        [{"Action": "DENY", "Line_Content": DENY_1433}],
+    )
+    script = _acl_script(args, trace_flow_ids=("f-db", "f-block"))
+    result, _, _ = _acl_run_proposed(script, client)
     assert len(result.candidates) == 1
     assert result.candidates[0].candidate_id == "c-01"
 
@@ -982,49 +1065,64 @@ def test_unrelated_target_flow_attribution_does_not_veto_valid_repair():
 
 
 def test_acl_repair_rejected_without_trace_attribution():
-    store = EvidenceStore()
-    rules = _seed_acl(store)
-    rule10 = next(r for r in rules if r["sequence_number"] == 10)
-    result, transport, _ = _run(_submit(_acl_submit(rule10)), store=store)
+    rule10 = next(r for r in _probe_acl_rules() if r["sequence_number"] == 10)
+    client = _acl_client([], [{"Action": "DENY", "Line_Content": DENY_1433}])
+    script = _acl_script(_acl_submit(rule10), trace_flow_ids=())
+    result, transport, _ = _acl_run_proposed(script, client)
     assert "ACL inventory alone is insufficient" in _tool_text(transport)
     assert result.candidates == []
 
 
 def test_acl_repair_rejected_on_ambiguous_attribution():
-    store = EvidenceStore()
-    rules = _seed_acl(store)
-    _seed_trace(store, resolution="ambiguous")
-    rule10 = next(r for r in rules if r["sequence_number"] == 10)
-    result, transport, _ = _run(_submit(_acl_submit(rule10)), store=store)
+    rule10 = next(r for r in _probe_acl_rules() if r["sequence_number"] == 10)
+    client = _acl_client(
+        [_denied_trace(_fdb_flow())],
+        [
+            {"Action": "DENY", "Line_Content": DENY_1433},
+            {"Action": "DENY", "Line_Content": DENY_1433},
+        ],
+    )
+    script = _acl_script(_acl_submit(rule10))
+    result, transport, _ = _acl_run_proposed(script, client)
     assert "ambiguous" in _tool_text(transport)
     assert result.candidates == []
 
 
 def test_acl_repair_rejected_on_wrong_acl_attribution():
-    store = EvidenceStore()
-    rules = _seed_acl(store)
-    _seed_trace(store, acl="OTHER-ACL")
-    rule10 = next(r for r in rules if r["sequence_number"] == 10)
-    result, transport, _ = _run(_submit(_acl_submit(rule10)), store=store)
-    assert "conflicting attribution" in _tool_text(transport)
+    # F-12: a trace naming an ACL that the config cannot reconcile (no
+    # unique match) cannot authorize the candidate. The OTHER-ACL hop
+    # resolves to "unresolved" because the fixture carries no such ACL,
+    # so the repair is rejected for missing attribution, not honored.
+    rule10 = next(r for r in _probe_acl_rules() if r["sequence_number"] == 10)
+    client = _acl_client(
+        [_denied_trace(_fdb_flow(), acl="OTHER-ACL")],
+        [{"Action": "DENY", "Line_Content": DENY_1433}],
+    )
+    script = _acl_script(_acl_submit(rule10))
+    result, transport, _ = _acl_run_proposed(script, client)
+    assert "does not uniquely attribute" in _tool_text(transport)
     assert result.candidates == []
 
 
 def test_acl_repair_rejected_on_wrong_sequence_attribution():
-    store = EvidenceStore()
-    rules = _seed_acl(store)
-    _seed_trace(store, sequence=20)
-    rule10 = next(r for r in rules if r["sequence_number"] == 10)
-    result, transport, _ = _run(_submit(_acl_submit(rule10)), store=store)
+    rule10 = next(r for r in _probe_acl_rules() if r["sequence_number"] == 10)
+    client = _acl_client(
+        [_denied_trace(_fdb_flow())],
+        [{"Action": "DENY", "Line_Content": DENY_22}],
+    )
+    script = _acl_script(_acl_submit(rule10))
+    result, transport, _ = _acl_run_proposed(script, client)
     assert "conflicting attribution" in _tool_text(transport)
     assert result.candidates == []
 
 
 def test_acl_repair_ignores_other_flow_trace():
-    store = EvidenceStore()
-    rules = _seed_acl(store)
-    _seed_trace(store, flow_id="f-block")
-    rule10 = next(r for r in rules if r["sequence_number"] == 10)
-    result, transport, _ = _run(_submit(_acl_submit(rule10)), store=store)
+    rule10 = next(r for r in _probe_acl_rules() if r["sequence_number"] == 10)
+    client = _acl_client(
+        [_denied_trace(_fblock_flow())],
+        [{"Action": "DENY", "Line_Content": DENY_1433}],
+    )
+    script = _acl_script(_acl_submit(rule10), trace_flow_ids=("f-block",))
+    result, transport, _ = _acl_run_proposed(script, client)
     assert "does not uniquely attribute" in _tool_text(transport)
     assert result.candidates == []

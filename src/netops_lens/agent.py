@@ -240,6 +240,11 @@ class _RunContext:
     baseline: SnapshotRef
     proposed: SnapshotRef
     settings: Settings
+    # F-12: evidence IDs that already existed when this Stage B invocation
+    # started (Stage A records, or records minted by an earlier invocation
+    # sharing the store). Candidate validation only honors records minted
+    # after this boundary; stale records can neither support nor veto.
+    evidence_boundary: frozenset[str] = frozenset()
     candidates: list[CandidatePatch] = field(default_factory=list)
     # F-10: per-RUN (not per-candidate) count of failed submissions.
     # MAX_PATCH_RETRIES therefore grants that many corrective retries per
@@ -266,10 +271,13 @@ def _route_rows_for(ctx: _RunContext, node: str, snapshot_name: str) -> list[dic
 
     F-01: the snapshot identity (``EvidenceRecord.snapshots``) is part of
     the lookup key. Baseline and proposed rows are never pooled, and rows
-    from unrelated runs never match.
+    from unrelated runs never match. F-12: only records minted after this
+    Stage B invocation's evidence boundary count.
     """
     rows: list[dict] = []
     for evidence_id in ctx.store.ids():
+        if evidence_id in ctx.evidence_boundary:
+            continue
         record = ctx.store.get(evidence_id)
         if record is None or record.tool != "get_routes":
             continue
@@ -298,10 +306,13 @@ def _acl_rules_for(ctx: _RunContext, node: str, acl: str, snapshot_name: str) ->
     F-01: only records whose ``EvidenceRecord.snapshots`` include the
     requested snapshot count. ``expected_rule`` matching always runs
     against these same-snapshot rules; no hit from another snapshot is
-    ever treated as authoritative.
+    ever treated as authoritative. F-12: only records minted after this
+    Stage B invocation's evidence boundary count.
     """
     rules: list[dict] = []
     for evidence_id in ctx.store.ids():
+        if evidence_id in ctx.evidence_boundary:
+            continue
         record = ctx.store.get(evidence_id)
         if record is None or record.tool != "get_acl_rules":
             continue
@@ -498,13 +509,17 @@ def _check_trace_attribution(
 
     R-2: only the specific target must_reach flow(s) the permit serves
     are relevant. Attributions belonging to unrelated flows are ignored
-    and can neither support nor veto this candidate.
+    and can neither support nor veto this candidate. F-12: only trace
+    records minted after this Stage B invocation's evidence boundary
+    count; stale attributions can neither support nor veto.
     """
     wanted = (remove.node, remove.acl, remove.sequence_number)
     seen_resolutions: set[str] = set()
     agreeing = False
     conflicting: list[tuple] = []
     for evidence_id in ctx.store.ids():
+        if evidence_id in ctx.evidence_boundary:
+            continue
         record = ctx.store.get(evidence_id)
         if record is None or record.tool != "trace_flow":
             continue
@@ -817,6 +832,9 @@ def run_stage_b(
         baseline=baseline,
         proposed=proposed,
         settings=resolved,
+        # F-12: freeze the pre-existing evidence IDs now, before any
+        # investigation tool mints records for this invocation.
+        evidence_boundary=frozenset(store.ids()),
     )
     try:
         if resolved.candidate_submission_variant != "tool":

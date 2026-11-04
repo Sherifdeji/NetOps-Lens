@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from netops_lens import cli
+from netops_lens import cli, pipeline
 from netops_lens.batfish_client import BatfishError
 from netops_lens.models import (
     ApplicationResult,
@@ -174,7 +174,7 @@ def _run(monkeypatch, tmp_path, fake, candidates, name="snapshots", **flags):
 
     monkeypatch.setattr(cli, "BatfishClient", lambda host, network: fake)
     monkeypatch.setattr(cli, "run_stage_b", _investigation)
-    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(pipeline, "REPO_ROOT", tmp_path)
     return cli.run_assess(_args(base, prop, intent, **flags))
 
 
@@ -307,7 +307,9 @@ def test_protected_name_collision_refused(monkeypatch, tmp_path, capsys):
     tag = "manual"
     answers = dict(_stage_a_answers(tag))
     fake = StageCFake(answers=answers)
-    monkeypatch.setattr(cli, "candidate_snapshot_name", lambda tag, cid: "manual-proposed")
+    monkeypatch.setattr(
+        pipeline, "candidate_snapshot_name", lambda tag, cid: "manual-proposed"
+    )
     code = _run(monkeypatch, tmp_path, fake, [_route_candidate()], json=True)
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
@@ -423,13 +425,13 @@ def test_verify_receives_canonical_candidate_ref(monkeypatch, tmp_path, capsys):
     answers[("differentialReachability", snap)] = [differential_row("ACCEPTED", "ACCEPTED")]
     fake = StageCFake(answers=answers)
     seen = []
-    real_verify = cli.verify_candidate
+    real_verify = pipeline.verify_candidate
 
     def recording(*args, **kwargs):
         seen.append(kwargs["candidate_ref"])
         return real_verify(*args, **kwargs)
 
-    monkeypatch.setattr(cli, "verify_candidate", recording)
+    monkeypatch.setattr(pipeline, "verify_candidate", recording)
     code = _run(monkeypatch, tmp_path, fake, [_route_candidate()], json=True)
     assert code == 0
     assert len(seen) == 1
@@ -478,7 +480,7 @@ def _pair_run(monkeypatch, tmp_path, answers, **flags):
 
     monkeypatch.setattr(cli, "BatfishClient", lambda host, network: fake)
     monkeypatch.setattr(cli, "run_stage_b", _investigation)
-    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(pipeline, "REPO_ROOT", tmp_path)
     argv = ["assess", "--baseline", str(base), "--proposed", str(prop),
             "--intent", str(intent_path)]
     if flags.get("json"):
@@ -872,7 +874,7 @@ def test_name_generation_failure_cleans_candidate_dir(monkeypatch, tmp_path, cap
     def _bad_name(tag, candidate_id):
         raise BatfishError("bad tag")
 
-    monkeypatch.setattr(cli, "candidate_snapshot_name", _bad_name)
+    monkeypatch.setattr(pipeline, "candidate_snapshot_name", _bad_name)
     code = _run(monkeypatch, tmp_path, fake, [_route_candidate()], json=True)
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
@@ -885,7 +887,9 @@ def test_name_generation_failure_cleans_candidate_dir(monkeypatch, tmp_path, cap
 
 def test_protected_name_collision_cleans_candidate_dir(monkeypatch, tmp_path, capsys):
     fake = StageCFake(answers=_verified_answers("manual"))
-    monkeypatch.setattr(cli, "candidate_snapshot_name", lambda tag, cid: f"{tag}-baseline")
+    monkeypatch.setattr(
+        pipeline, "candidate_snapshot_name", lambda tag, cid: f"{tag}-baseline"
+    )
     code = _run(monkeypatch, tmp_path, fake, [_route_candidate()], json=True)
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
@@ -949,7 +953,7 @@ def test_directory_cleanup_failure_warns_without_masking(monkeypatch, tmp_path, 
     def _boom(target):
         raise OSError("disk read-only")
 
-    monkeypatch.setattr(cli.shutil, "rmtree", _boom)
+    monkeypatch.setattr(pipeline.shutil, "rmtree", _boom)
     code = _run(monkeypatch, tmp_path, fake, [_route_candidate()], json=True)
     assert code == 0
     captured = capsys.readouterr()
@@ -962,10 +966,14 @@ def test_unrelated_directories_are_never_removed(monkeypatch, tmp_path, capsys):
     keeper = tmp_path / "runs" / "keep-me"
     keeper.mkdir(parents=True)
     (keeper / "notes.txt").write_text("do not delete")
-    cli._remove_candidate_dir(tmp_path / "runs", tmp_path / "runs" / "root")
-    cli._remove_candidate_dir(keeper, tmp_path / "other-root")
+    warnings: list[str] = []
+    pipeline._remove_candidate_dir(
+        tmp_path / "runs", tmp_path / "runs" / "root", warnings.append
+    )
+    pipeline._remove_candidate_dir(keeper, tmp_path / "other-root", warnings.append)
     assert (keeper / "notes.txt").read_text() == "do not delete"
     assert (tmp_path / "runs").is_dir()
+    assert warnings != []
 
 
 def test_fail_plus_unknown_is_unverifiable_end_to_end(monkeypatch, tmp_path, capsys):

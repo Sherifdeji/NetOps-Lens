@@ -110,3 +110,41 @@ def assemble_report(
         evidence_index=evidence_index,
         traces=[],
     )
+
+
+def apply_human_decisions(
+    report: Report, decisions: Mapping[str, HumanDecision]
+) -> Report:
+    """Return a copy of ``report`` with ``human_decision`` replaced.
+
+    The pipeline assembles the report with every decision ``PENDING`` and
+    returns before any terminal interaction; the CLI calls this afterwards
+    to record interactive approvals without rerunning the assessment.
+    The same legality rules as :func:`assemble_report` apply: decision
+    keys must match the applications exactly, and ``APPROVED`` is allowed
+    only for ``VERIFIED`` candidates. Approval records a decision only.
+    """
+    app_ids = [a.candidate_id for a in report.applications]
+    if set(decisions) != set(app_ids):
+        raise ReportError(
+            "candidate human-decision mismatch: "
+            f"decisions={sorted(decisions)}, applications={sorted(app_ids)}"
+        )
+    ver_by_id = {v.candidate_id: v for v in report.verifications}
+    for candidate_id, decision in decisions.items():
+        verification = ver_by_id.get(candidate_id)
+        if verification is None:
+            raise ReportError(
+                f"candidate {candidate_id} has no verification entry; "
+                "cannot record a human decision"
+            )
+        if decision == "APPROVED" and verification.status != "VERIFIED":
+            raise ReportError(
+                f"candidate {candidate_id} decision APPROVED is illegal "
+                f"for verification status {verification.status}"
+            )
+    # Deep copy: the report graph holds mutable lists and dicts
+    # (applications, verifications, decisions, evidence index, traces,
+    # investigation), so a shallow copy would keep sharing them with the
+    # original. The retained report must stay independent of this update.
+    return report.model_copy(update={"human_decision": dict(decisions)}, deep=True)
