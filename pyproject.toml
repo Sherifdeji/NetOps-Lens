@@ -31,10 +31,13 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # F-07: ordinary runs execute only safe deterministic tests. Live
-# Meta API + Batfish integration runs explicitly with: pytest -m live
-addopts = ["-m", "not live"]
+# Meta API + Batfish integration runs explicitly with: pytest -m live.
+# Controlled Batfish snapshot-lifecycle runs explicitly with:
+# NETOPS_LENS_RUN_BATFISH_INTEGRATION=1 pytest -m integration tests/integration
+addopts = ["-m", "not live and not integration"]
 markers = [
     "live: live Meta API + Batfish integration (excluded from default runs)",
+    "integration: controlled live-Batfish lifecycle (opt-in via env, excluded from default runs)",
 ]
 
 [tool.mypy]
