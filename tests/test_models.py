@@ -12,11 +12,13 @@ from netops_lens.models import (
     AclPermit,
     AclRule,
     AddStaticRoute,
+    ApplicationResult,
     AssessmentResult,
     CandidatePatch,
     CandidateSubmission,
     ClaimType,
     EvidenceRecord,
+    FileDiff,
     Finding,
     FlowComparison,
     FlowSpec,
@@ -564,3 +566,60 @@ def test_snapshot_health_consistency_rules():
         {"snapshot": "s", "status": "NOT_OK", "reasons": ["r1.cfg failed to parse"]}
     )
     assert not_ok.status == "NOT_OK"
+
+
+def _application_result() -> ApplicationResult:
+    return ApplicationResult(
+        candidate_id="c-01",
+        applied=True,
+        changed_files=("configs/r1.cfg",),
+        diff=(
+            FileDiff(
+                file="configs/r1.cfg",
+                removed=("10 deny tcp 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255 eq 1433",),
+                added=("10 permit tcp 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255 eq 1433",),
+            ),
+        ),
+    )
+
+
+def test_file_diff_and_application_result_round_trip():
+    result = _application_result()
+    restored = ApplicationResult.model_validate(json.loads(result.model_dump_json()))
+    assert restored == result
+    assert restored.diff[0].file == "configs/r1.cfg"
+
+
+def test_application_result_is_frozen():
+    result = _application_result()
+    with pytest.raises(ValidationError):
+        result.applied = False  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        result.changed_files += ("configs/r2.cfg",)  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        result.diff[0].removed += ("extra",)  # type: ignore[misc]
+
+
+def test_application_result_uses_tuples_for_collections():
+    result = ApplicationResult(candidate_id="c-02", applied=False, reasons=["boom"])
+    assert result.changed_files == ()
+    assert result.diff == ()
+    assert isinstance(result.reasons, tuple)
+
+
+def test_report_has_no_applications_field():
+    # Clarification 1: Report.applications belongs to Phase 4.3, not 4.1.
+    assert "applications" not in Report.model_fields
+    report = Report(assessment=AssessmentResult(verdict="NO_REGRESSION_DETECTED"))
+    assert "applications" not in report.model_dump()
+
+
+def test_candidate_patch_rejects_malformed_ids():
+    base = {
+        "rationale": "x",
+        "operations": [_route_op()],
+        "target_flow_ids": ["f"],
+    }
+    for bad_id in ("../evil", "c-", "candidate-1"):
+        with pytest.raises(ValidationError):
+            CandidatePatch.model_validate({**base, "candidate_id": bad_id})

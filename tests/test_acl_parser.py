@@ -10,6 +10,7 @@ from netops_lens.acl_parser import (
     AclParseError,
     load_node_acl,
     parse_acl_rule_line,
+    parse_acl_stanza,
     parse_extended_acl,
 )
 
@@ -124,6 +125,87 @@ def test_duplicate_sequence_rejected():
     )
     with pytest.raises(AclParseError, match="duplicate sequence 10"):
         parse_extended_acl(config, "DB-FILTER")
+
+
+def test_stanza_span_and_line_indices_on_fixture():
+    stanza = parse_acl_stanza(ACL_PROPOSED_R1, "DB-FILTER")
+    assert stanza.name == "DB-FILTER"
+    lines = ACL_PROPOSED_R1.splitlines()
+    assert lines[stanza.header_index].strip() == "ip access-list extended DB-FILTER"
+    assert all(
+        line == "" or line[:1].isspace()
+        for line in lines[stanza.header_index + 1 : stanza.end_index]
+    )
+    assert [r.sequence_number for r in stanza.rules] == [10, 20]
+    for rule in stanza.rules:
+        assert lines[rule.line_index].strip() == rule.raw_line
+    assert lines[stanza.end_index].strip() == "!"
+
+
+def test_stanza_span_skips_blank_lines_but_keeps_them():
+    config = (
+        "ip access-list extended DB-FILTER\n"
+        "\n"
+        " 10 permit tcp any any eq 1433\n"
+        "   \n"
+        " 20 deny tcp any any eq 22\n"
+        "!\n"
+    )
+    stanza = parse_acl_stanza(config, "DB-FILTER")
+    assert stanza.header_index == 0
+    assert stanza.end_index == 5
+    assert [r.line_index for r in stanza.rules] == [2, 4]
+
+
+def test_stanza_span_ends_at_end_or_bare_line():
+    for terminator in ("end", "interface GigabitEthernet0/0"):
+        config = (
+            "ip access-list extended DB-FILTER\n"
+            " 10 permit tcp any any eq 1433\n"
+            f"{terminator}\n"
+        )
+        stanza = parse_acl_stanza(config, "DB-FILTER")
+        assert stanza.end_index == 2
+        assert [r.sequence_number for r in stanza.rules] == [10]
+
+
+def test_stanza_zero_or_multiple_names_rejected():
+    with pytest.raises(AclParseError, match="not found"):
+        parse_acl_stanza("hostname r1\n!\nend\n", "DB-FILTER")
+    doubled = (
+        "ip access-list extended DB-FILTER\n"
+        " 10 permit tcp any any eq 1433\n"
+        "!\n"
+        "ip access-list extended DB-FILTER\n"
+        " 20 deny tcp any any eq 22\n"
+        "!\n"
+    )
+    with pytest.raises(AclParseError, match="multiple"):
+        parse_acl_stanza(doubled, "DB-FILTER")
+    with pytest.raises(AclParseError, match="multiple"):
+        parse_extended_acl(doubled, "DB-FILTER")
+
+
+def test_stanza_remark_and_unnumbered_lines_rejected():
+    remark = (
+        "ip access-list extended DB-FILTER\n"
+        " 10 permit tcp any any eq 1433\n"
+        " remark db block\n"
+        "!\n"
+    )
+    with pytest.raises(AclParseError, match="remark db block"):
+        parse_acl_stanza(remark, "DB-FILTER")
+    unnumbered = (
+        "ip access-list extended DB-FILTER\n"
+        " permit tcp any any\n"
+        "!\n"
+    )
+    with pytest.raises(AclParseError, match="without sequence number"):
+        parse_acl_stanza(unnumbered, "DB-FILTER")
+
+
+def test_standalone_rule_line_index_is_minus_one():
+    assert parse_acl_rule_line("10 permit tcp any any eq 1433").line_index == -1
 
 
 def test_missing_or_empty_stanza_rejected():

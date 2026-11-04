@@ -362,6 +362,34 @@ class CandidatePatch(CandidateSubmission):
     candidate_id: CandidateId
 
 
+class FileDiff(FrozenModel):
+    """Touched lines of one changed file, no surrounding context.
+
+    ``file`` is a snapshot-relative path (``configs/r1.cfg``) — never an
+    absolute filesystem path. Line texts are stripped, without newlines.
+    """
+
+    file: str = Field(min_length=1)
+    removed: tuple[str, ...] = ()
+    added: tuple[str, ...] = ()
+
+
+class ApplicationResult(FrozenModel):
+    """Outcome of applying one candidate to a disposable proposed copy.
+
+    ``changed_files`` mirrors the ``FileDiff.file`` values. ``applied`` is
+    false when validation, rendering, or writing failed; ``reasons`` names
+    every blocking cause. Collections are tuples: Stage C results feeding
+    the final report stay immutable.
+    """
+
+    candidate_id: CandidateId
+    applied: bool
+    changed_files: tuple[str, ...] = ()
+    diff: tuple[FileDiff, ...] = ()
+    reasons: tuple[str, ...] = ()
+
+
 class VerificationCheck(NetOpsModel):
     name: str = Field(min_length=1)
     outcome: Literal["pass", "fail", "unknown"]

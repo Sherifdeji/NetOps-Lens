@@ -9,6 +9,7 @@ callers (Phase 2 ``tools.py``) can convert them to typed tool results.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -74,6 +75,41 @@ class HealthRecords:
     nodes: tuple[Record, ...] = ()
 
 
+_CANDIDATE_ID_PATTERN = re.compile(r"c-[0-9]+")
+_GENERATED_SNAPSHOT_PATTERN = re.compile(r"[a-z0-9-]+-candidate-c-[0-9]+")
+
+
+def _is_generated_candidate_name(name: str) -> bool:
+    """Full-shape check for a generated candidate snapshot name.
+
+    Mirrors the ``candidate_snapshot_name`` output shape: a sanitized tag
+    (lowercase alphanumeric-plus-dash), ``-candidate-``, and a ``c-<digits>``
+    ID. Baseline, proposed, foreign, and traversal strings never match.
+    """
+    return _GENERATED_SNAPSHOT_PATTERN.fullmatch(name) is not None
+
+
+def candidate_snapshot_name(tag: str, candidate_id: str) -> str:
+    """Build a ``{tag}-candidate-{candidate_id}`` snapshot name.
+
+    The tag is sanitized with the same lowercase alphanumeric-plus-dash
+    rule as ``cli.run_network_name``; the candidate ID must match the
+    Python ``c-NN`` contract. Anything else is a ``BatfishError``.
+    """
+    safe_tag = "".join(c if c.isalnum() else "-" for c in tag.lower())
+    if not safe_tag:
+        raise BatfishError(f"invalid snapshot tag: {tag!r}")
+    if _CANDIDATE_ID_PATTERN.fullmatch(candidate_id) is None:
+        raise BatfishError(f"invalid candidate id: {candidate_id!r}")
+    return f"{safe_tag}-candidate-{candidate_id}"
+
+
+def _is_missing_snapshot(exc: Exception) -> bool:
+    """Detect a missing-snapshot (404) outcome without importing requests."""
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) == 404
+
+
 class BatfishClient:
     """Owns one Batfish session: connect, init snapshots, ask questions."""
 
@@ -108,6 +144,7 @@ class BatfishClient:
         self._host = host
         self._network = network
         self._session: Session | None = None
+        self._candidate_snapshots: set[str] = set()
 
     @property
     def host(self) -> str:
@@ -167,6 +204,51 @@ class BatfishClient:
                 f"init_snapshot failed for {str(snapshot_dir)!r} as {name!r}: {type(exc).__name__}"
             ) from exc
         return name
+
+    def register_candidate_snapshot(self, name: str) -> None:
+        """Record a candidate snapshot this client created.
+
+        Only generated candidate snapshot names validate: anything else —
+        baseline, proposed, foreign, or traversal strings — raises
+        ``BatfishError`` and registers nothing. Phase 4.2 calls this after
+        a successful ``init_snapshot(..., overwrite=False)``.
+        """
+        if not _is_generated_candidate_name(name):
+            raise BatfishError(f"refusing to register non-candidate snapshot {name!r}")
+        self._candidate_snapshots.add(name)
+
+    def delete_snapshot(self, name: str) -> None:
+        """Delete one candidate snapshot this run created.
+
+        The generated-name shape is re-checked at delete time (defense in
+        depth), so baseline and proposed snapshots are protected
+        unconditionally, independently of registry state. Names never
+        registered are refused without contacting Batfish. The name leaves
+        the registry only on success or on an explicitly missing-snapshot
+        (404) outcome; other failures keep the registration. Everything
+        surfaces as ``BatfishError``; callers doing best-effort cleanup
+        must catch it.
+        """
+        if not _is_generated_candidate_name(name):
+            raise BatfishError(f"refusing to delete non-candidate snapshot {name!r}")
+        if name not in self._candidate_snapshots:
+            raise BatfishError(f"refusing to delete unregistered snapshot {name!r}")
+        session = self._session
+        if session is None:
+            try:
+                session = Session(host=self._host)
+            except Exception as exc:
+                raise BatfishError(
+                    f"cannot reach Batfish at {self._host!r}: {type(exc).__name__}"
+                ) from exc
+        try:
+            session.delete_snapshot(name)
+        except Exception as exc:
+            if _is_missing_snapshot(exc):
+                self._candidate_snapshots.discard(name)
+                raise BatfishError(f"snapshot {name!r} already absent") from exc
+            raise BatfishError(f"cannot delete snapshot {name!r}: {exc}") from exc
+        self._candidate_snapshots.discard(name)
 
     def ask(
         self,

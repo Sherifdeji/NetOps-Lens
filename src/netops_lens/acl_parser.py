@@ -33,6 +33,23 @@ class ParsedAclRule:
     sequence_number: int
     rule: AclRule
     raw_line: str
+    line_index: int = -1
+    """Index into the source line list; -1 when parsed standalone."""
+
+
+@dataclass(frozen=True)
+class AclStanza:
+    """One named extended-ACL stanza with source positions.
+
+    ``header_index`` is the stanza header line; ``end_index`` is exclusive,
+    so ``lines[header_index:end_index]`` is the full span. ``rules`` carry
+    the ``line_index`` of their source line within the same line list.
+    """
+
+    name: str
+    header_index: int
+    end_index: int
+    rules: tuple[ParsedAclRule, ...]
 
 
 def _wildcard_to_prefixlen(address: str, wildcard: str, raw_line: str) -> str:
@@ -110,34 +127,61 @@ def parse_acl_rule_line(raw_line: str) -> ParsedAclRule:
     return ParsedAclRule(sequence_number=sequence_number, rule=rule, raw_line=line)
 
 
-def parse_extended_acl(config_text: str, acl_name: str) -> tuple[ParsedAclRule, ...]:
-    """Parse the named extended ACL stanza from one device config."""
+def parse_acl_stanza(config_text: str, acl_name: str) -> AclStanza:
+    """Parse one named extended-ACL stanza, exposing its source span.
+
+    Exactly one stanza with ``acl_name`` must exist (zero or multiple is an
+    error). The span runs from the header line to the first ``!`` / ``end`` /
+    non-indented line or EOF (exclusive end). Blank lines inside the span
+    are preserved in the span but skipped as rules; any other non-blank
+    span line that does not parse as a rule — remarks, unnumbered lines,
+    unsupported syntax — is an error naming the line, never a silent skip.
+    """
     lines = config_text.splitlines()
     header = f"ip access-list extended {acl_name}"
-    start: int | None = None
-    for i, line in enumerate(lines):
-        if line.strip() == header:
-            start = i
-            break
-    if start is None:
+    starts = [i for i, line in enumerate(lines) if line.strip() == header]
+    if not starts:
         raise AclParseError(f"ACL {acl_name!r} stanza not found")
+    if len(starts) > 1:
+        raise AclParseError(f"multiple ACL {acl_name!r} stanzas found")
+    start = starts[0]
+
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        stripped = lines[i].strip()
+        if not stripped:
+            continue
+        if stripped == "!" or stripped == "end" or not lines[i][:1].isspace():
+            end = i
+            break
 
     rules: list[ParsedAclRule] = []
     seen: set[int] = set()
-    for line in lines[start + 1 :]:
-        stripped = line.strip()
+    for i in range(start + 1, end):
+        stripped = lines[i].strip()
         if not stripped:
             continue
-        if stripped == "!" or stripped == "end" or not line[:1].isspace():
-            break
         parsed = parse_acl_rule_line(stripped)
         if parsed.sequence_number in seen:
             raise AclParseError(f"duplicate sequence {parsed.sequence_number} in ACL {acl_name!r}")
         seen.add(parsed.sequence_number)
-        rules.append(parsed)
-    if not rules:
+        rules.append(
+            ParsedAclRule(
+                sequence_number=parsed.sequence_number,
+                rule=parsed.rule,
+                raw_line=parsed.raw_line,
+                line_index=i,
+            )
+        )
+    return AclStanza(name=acl_name, header_index=start, end_index=end, rules=tuple(rules))
+
+
+def parse_extended_acl(config_text: str, acl_name: str) -> tuple[ParsedAclRule, ...]:
+    """Parse the named extended ACL stanza from one device config."""
+    stanza = parse_acl_stanza(config_text, acl_name)
+    if not stanza.rules:
         raise AclParseError(f"ACL {acl_name!r} has no parseable rules")
-    return tuple(rules)
+    return stanza.rules
 
 
 def load_node_acl(snapshot_dir: str | Path, node: str, acl_name: str) -> tuple[ParsedAclRule, ...]:
