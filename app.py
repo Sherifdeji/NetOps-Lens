@@ -1,17 +1,17 @@
-"""NetOps Lens Streamlit shell + assessment view (Phase 5.2, P52-02).
+"""NetOps Lens Streamlit shell + assessment view (Phase 5.2, P52-03).
 
 Session-state contract: this increment manages exactly one key,
 ``report`` — the completed ``Report`` from the latest successful run. A new
 Run replaces the report wholesale; nothing is merged across runs.
-Human-decision state (``human_decisions``) is owned by P52-03; the Run
-button drops that key if present so no stale decisions survive. Widget
+Human decisions live inside the stored report's ``human_decision`` map;
+there is no parallel decisions structure. The Run button drops a legacy
+``human_decisions`` key if present so no stale state survives. Widget
 state is owned by Streamlit itself.
 
-What this increment does NOT contain: investigation, candidate,
-verification, or human-decision/approval UI (P52-03), and no deployment or
-device interaction of any kind. Approval records a decision only, and even
-that UI does not exist yet. The verdict shown here always comes directly
-from ``Report.assessment.verdict``, which Python alone produces.
+Approval records a decision only. It does not deploy, push, or apply
+anything to any device, and no deployment interaction exists anywhere in
+this UI. The verdict shown here always comes directly from
+``Report.assessment.verdict``, which Python alone produces.
 """
 
 from __future__ import annotations
@@ -23,7 +23,17 @@ import streamlit as st
 from netops_lens.assessment import AssessmentError
 from netops_lens.batfish_client import BatfishError
 from netops_lens.intent import IntentError
-from netops_lens.models import Report
+from netops_lens.models import (
+    AclDeny,
+    AclPermit,
+    AddStaticRoute,
+    ApplicationResult,
+    HumanDecision,
+    PatchOperation,
+    RemoveAclLine,
+    RemoveStaticRoute,
+    Report,
+)
 from netops_lens.pipeline import (
     AssessmentRequest,
     PipelineConnectionError,
@@ -32,7 +42,7 @@ from netops_lens.pipeline import (
     load_manifest,
     run_assessment_pipeline,
 )
-from netops_lens.report import ReportError
+from netops_lens.report import ReportError, apply_human_decisions
 
 MODE_SCENARIO = "Scenario"
 MODE_MANUAL = "Manual paths"
@@ -257,6 +267,171 @@ def main() -> None:
     stored = st.session_state.get(REPORT_KEY)
     if stored is not None:
         render_assessment(stored)
+        render_investigation(stored)
+        render_candidates(stored)
+
+
+def describe_op(op: PatchOperation) -> str:
+    """One-line display text for a patch operation (display only)."""
+    if isinstance(op, (AddStaticRoute, RemoveStaticRoute)):
+        return f"{op.op} {op.node} {op.prefix} via {op.next_hop}"
+    if isinstance(op, (AclPermit, AclDeny)):
+        return (
+            f"{op.op} {op.node} {op.acl} seq {op.sequence_number} "
+            f"{op.src} {op.dst} {op.protocol} {op.dst_port}"
+        )
+    if isinstance(op, RemoveAclLine):
+        rule = op.expected_rule
+        return (
+            f"{op.op} {op.node} {op.acl} seq {op.sequence_number} "
+            f"expect {rule.action} {rule.src} {rule.dst} "
+            f"{rule.protocol} {rule.dst_port}"
+        )
+    return str(getattr(op, "op", "?"))
+
+
+def candidate_diff_text(application: ApplicationResult) -> str:
+    """Deterministic plain-text rendering of a candidate's file diffs."""
+    lines: list[str] = []
+    for diff in application.diff:
+        lines.append(diff.file)
+        lines.extend(f"- {line}" for line in diff.removed)
+        lines.extend(f"+ {line}" for line in diff.added)
+    return "".join(f"{line}\n" for line in lines)
+
+
+def render_investigation(report: Report) -> None:
+    """Render the bounded Muse Spark investigation (never the verdict)."""
+    st.subheader("Investigation (Muse Spark)")
+    st.caption(
+        "AI-generated explanation of the Python findings above. "
+        "It does not change the verdict."
+    )
+    investigation = report.investigation
+    if investigation is None:
+        st.write("Investigation was not run for this assessment.")
+        return
+    st.write(investigation.narrative or "(no narrative)")
+    if not investigation.tool_activity:
+        st.write("(no tool activity)")
+        return
+    st.write("Tool activity:")
+    for log in investigation.tool_activity:
+        latency = f", {log.latency_ms:.0f} ms" if log.latency_ms is not None else ""
+        st.write(f"{log.tool} (evidence: {log.evidence_id or '-'}{latency})")
+        with st.expander(f"Arguments: {log.tool}"):
+            st.json(log.args)
+
+
+def _record_decision(candidate_id: str, decision: HumanDecision) -> None:
+    """Record one human decision on the stored report, then refresh.
+
+    Builds the complete decisions map from the current stored report and
+    changes only the clicked candidate. Never reruns the pipeline.
+    """
+    stored = st.session_state.get(REPORT_KEY)
+    if stored is None:
+        return
+    full_map = dict(stored.human_decision)
+    full_map[candidate_id] = decision
+    try:
+        st.session_state[REPORT_KEY] = apply_human_decisions(stored, full_map)
+    except ReportError as exc:
+        st.error(str(exc))
+        return
+    st.rerun()
+
+
+def render_candidates(report: Report) -> None:
+    """Render candidates with independent verification and decision controls."""
+    st.subheader("Candidates & independent verification")
+    investigation = report.investigation
+    candidates = investigation.candidates if investigation is not None else []
+    if not candidates:
+        st.write("No candidates were proposed.")
+        return
+    app_by_id = {app.candidate_id: app for app in report.applications}
+    ver_by_id = {verification.candidate_id: verification for verification in report.verifications}
+    for candidate in candidates:
+        candidate_id = candidate.candidate_id
+        st.subheader(f"Candidate {candidate_id}")
+        st.write(candidate.rationale)
+        st.write(f"Targets: {', '.join(candidate.target_flow_ids)}")
+        st.dataframe(
+            [
+                {
+                    "op": getattr(op, "op", "?"),
+                    "node": getattr(op, "node", "-"),
+                    "parameters": describe_op(op),
+                }
+                for op in candidate.operations
+            ]
+        )
+        application = app_by_id.get(candidate_id)
+        verification = ver_by_id.get(candidate_id)
+        if application is None or verification is None:
+            st.write("no verification record")
+            st.write(
+                f"Human decision: {report.human_decision.get(candidate_id, 'PENDING')}"
+            )
+            st.write("Human decision requires VERIFIED status.")
+            continue
+        st.write(f"Application: {'applied' if application.applied else 'FAILED'}")
+        if not application.applied and application.reasons:
+            for reason in application.reasons:
+                st.write(f"- {reason}")
+        if application.diff:
+            for diff in application.diff:
+                st.write(f"Changed file: {diff.file}")
+                st.code(
+                    "\n".join(
+                        [f"- {line}" for line in diff.removed]
+                        + [f"+ {line}" for line in diff.added]
+                    )
+                )
+        elif application.applied:
+            st.write("Applied with no diff lines.")
+        status = verification.status
+        if status == "VERIFIED":
+            st.success(f"Verification: {status}")
+        elif status == "REJECTED":
+            st.error(f"Verification: {status}")
+        else:
+            st.warning(f"Verification: {status}")
+        markers = {"pass": "✓", "fail": "✗", "unknown": "?"}
+        for check in verification.checks:
+            st.write(
+                f"{markers.get(check.outcome, '?')} {check.name}: "
+                f"{check.outcome} ({check.detail})"
+            )
+            if check.evidence_ids:
+                st.write(f"evidence: {', '.join(check.evidence_ids)}")
+        for reason in verification.reasons:
+            st.write(f"- {reason}")
+        st.write(
+            f"Human decision: {report.human_decision.get(candidate_id, 'PENDING')}"
+        )
+        st.write(
+            "Approval records your decision only. It does not deploy, push, "
+            "or apply anything to any device."
+        )
+        if status == "VERIFIED":
+            if st.button(
+                f"Approve {candidate_id}", key=f"approve-{candidate_id}"
+            ):
+                _record_decision(candidate_id, "APPROVED")
+            if st.button(f"Reject {candidate_id}", key=f"reject-{candidate_id}"):
+                _record_decision(candidate_id, "REJECTED")
+            if application.applied and application.diff:
+                st.download_button(
+                    f"Download diff {candidate_id}",
+                    data=candidate_diff_text(application),
+                    file_name=f"{candidate_id}-diff.txt",
+                    mime="text/plain",
+                    key=f"download-{candidate_id}",
+                )
+        else:
+            st.write("Human decision requires VERIFIED status.")
 
 
 if __name__ == "__main__":

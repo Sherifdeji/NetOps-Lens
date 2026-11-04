@@ -17,7 +17,18 @@ from __future__ import annotations
 import pytest
 
 import app
-from netops_lens.models import AssessmentResult, FlowComparison, Report
+from netops_lens.models import (
+    ApplicationResult,
+    AssessmentResult,
+    CandidatePatch,
+    FileDiff,
+    FlowComparison,
+    InvestigationResult,
+    Report,
+    ToolCallLog,
+    VerificationCheck,
+    VerificationResult,
+)
 from netops_lens.pipeline import REPO_ROOT
 from streamlit.testing.v1 import AppTest
 
@@ -34,6 +45,7 @@ def _texts(at: AppTest) -> list[str]:
         at.markdown,
         at.text,
         at.caption,
+        at.code,
         at.info,
         at.success,
         at.warning,
@@ -124,9 +136,7 @@ def test_render_assessment_shows_verdict_and_scoping_note():
     ), "the scoping note must accompany NO_REGRESSION_DETECTED"
     frames = [df.value for df in at.dataframe]
     assert frames, "flow comparisons must render as a table"
-    assert any(
-        "NO_CHANGE_OK" in frame.astype(str).values for frame in frames
-    )
+    assert any("NO_CHANGE_OK" in cell for cell in _frame_cells(frames))
 
 
 def _regression_report() -> Report:
@@ -194,6 +204,282 @@ def test_run_failure_shows_error_and_clears_report(monkeypatch):
     assert any("bad input probe" in e.value for e in at.error)
     assert not any("Verdict:" in text for text in _texts(at))
     assert "report" not in at.session_state
+
+
+def _full_report() -> Report:
+    """Canned regression: VERIFIED c-01 plus a REJECTED c-02 in one report."""
+    investigation = InvestigationResult(
+        narrative="The database flow regressed in the proposed snapshot.",
+        candidates=[
+            CandidatePatch(
+                candidate_id="c-01",
+                rationale="restore the missing static route",
+                operations=[
+                    {
+                        "op": "add_static_route",
+                        "node": "r1",
+                        "prefix": "198.51.100.0/24",
+                        "next_hop": "10.0.12.2",
+                    }
+                ],
+                target_flow_ids=["web"],
+            ),
+            CandidatePatch(
+                candidate_id="c-02",
+                rationale="alternative next hop",
+                operations=[
+                    {
+                        "op": "add_static_route",
+                        "node": "r1",
+                        "prefix": "198.51.100.0/24",
+                        "next_hop": "10.0.12.3",
+                    }
+                ],
+                target_flow_ids=["web"],
+            ),
+        ],
+        tool_activity=[
+            ToolCallLog(
+                tool="trace_flow",
+                args={"flow_id": "web", "snapshot": "proposed"},
+                evidence_id="ev-0001",
+                latency_ms=12.0,
+            )
+        ],
+    )
+    return Report(
+        assessment=AssessmentResult(
+            verdict="REGRESSION_DETECTED",
+            flow_comparisons=(
+                FlowComparison(
+                    flow_id="web",
+                    kind="must_reach",
+                    baseline_reach="REACHABLE",
+                    proposed_reach="UNREACHABLE",
+                    classification="REGRESSION",
+                ),
+            ),
+            findings=(),
+            inconclusive_reasons=(),
+            health=(),
+        ),
+        investigation=investigation,
+        applications=[
+            ApplicationResult(
+                candidate_id="c-01",
+                applied=True,
+                changed_files=("configs/r1.cfg",),
+                diff=(
+                    FileDiff(
+                        file="configs/r1.cfg",
+                        removed=(),
+                        added=("ip route 198.51.100.0 255.255.255.0 10.0.12.2",),
+                    ),
+                ),
+                reasons=(),
+            ),
+            ApplicationResult(
+                candidate_id="c-02",
+                applied=True,
+                changed_files=(),
+                diff=(),
+                reasons=(),
+            ),
+        ],
+        verifications=[
+            VerificationResult(
+                candidate_id="c-01",
+                status="VERIFIED",
+                reasons=(),
+                checks=(
+                    VerificationCheck(
+                        name="candidate_health",
+                        outcome="pass",
+                        detail="snapshot healthy",
+                        evidence_ids=("ev-0001",),
+                    ),
+                    VerificationCheck(
+                        name="reachability_restored",
+                        outcome="pass",
+                        detail="flow reachable",
+                        evidence_ids=("ev-0002",),
+                    ),
+                ),
+                evidence_ids=("ev-0001", "ev-0002"),
+                candidate_snapshot="manual-candidate-c-01",
+            ),
+            VerificationResult(
+                candidate_id="c-02",
+                status="REJECTED",
+                reasons=("regression persists on the candidate",),
+                checks=(
+                    VerificationCheck(
+                        name="candidate_health",
+                        outcome="fail",
+                        detail="snapshot unhealthy",
+                        evidence_ids=(),
+                    ),
+                ),
+                evidence_ids=(),
+                candidate_snapshot="manual-candidate-c-02",
+            ),
+        ],
+        human_decision={"c-01": "PENDING", "c-02": "PENDING"},
+    )
+
+
+def _run_with_fake(monkeypatch):
+    import netops_lens.pipeline as pipeline_module
+
+    calls: list = []
+    canned = _full_report()
+
+    def _fake(request, **kwargs):
+        calls.append((request, kwargs))
+        return canned
+
+    monkeypatch.setattr(pipeline_module, "run_assessment_pipeline", _fake)
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    at.sidebar.button[0].click().run()
+    assert at.exception == [], [str(e) for e in at.exception]
+    assert len(calls) == 1
+    return at, calls, canned
+
+
+def _frame_cells(frames: list) -> list[str]:
+    """Every dataframe cell as a string (``in`` on a 2D array is row-wise)."""
+    return [
+        str(cell)
+        for frame in frames
+        for row in frame.astype(str).values.tolist()
+        for cell in row
+    ]
+
+
+def _click_button(at: AppTest, label: str) -> None:
+    matches = [button for button in at.button if button.label == label]
+    assert matches, f"button {label!r} not rendered"
+    matches[0].click().run()
+    assert at.exception == [], [str(e) for e in at.exception]
+
+
+def test_render_investigation_shows_narrative_and_activity():
+    at = AppTest.from_file(APP_PATH)
+    at.session_state["report"] = _full_report()
+    at.run()
+    assert at.exception == [], [str(e) for e in at.exception]
+    texts = _texts(at)
+    assert any("regressed in the proposed snapshot" in text for text in texts)
+    assert any("trace_flow" in text for text in texts)
+    assert any("ev-0001" in text for text in texts)
+    assert any("does not change the verdict" in text for text in texts)
+
+
+def test_render_investigation_absent_when_not_run():
+    at = AppTest.from_file(APP_PATH)
+    at.session_state["report"] = _canned_report()
+    at.run()
+    assert at.exception == [], [str(e) for e in at.exception]
+    assert any(
+        "Investigation was not run for this assessment." in text
+        for text in _texts(at)
+    )
+
+
+def test_render_candidates_shows_verified_candidate():
+    at = AppTest.from_file(APP_PATH)
+    at.session_state["report"] = _full_report()
+    at.run()
+    assert at.exception == [], [str(e) for e in at.exception]
+    texts = _texts(at)
+    assert any("Candidate c-01" in text for text in texts)
+    frames = [df.value for df in at.dataframe]
+    assert frames, "operations must render as a table"
+    cells = _frame_cells(frames)
+    assert any("add_static_route" in cell for cell in cells)
+    assert any("10.0.12.2" in cell for cell in cells), (
+        "operation parameters must be visible"
+    )
+    assert any(
+        "ip route 198.51.100.0 255.255.255.0 10.0.12.2" in text for text in texts
+    ), "diff lines must render"
+    assert "Verification: VERIFIED" in [s.value for s in at.success]
+    assert any("candidate_health" in text for text in texts)
+    assert any("reachability_restored" in text for text in texts)
+
+
+def test_non_verified_candidate_has_no_decision_buttons():
+    at = AppTest.from_file(APP_PATH)
+    at.session_state["report"] = _full_report()
+    at.run()
+    assert at.exception == [], [str(e) for e in at.exception]
+    assert "Verification: REJECTED" in [e.value for e in at.error]
+    labels = [button.label for button in at.button]
+    assert "Approve c-01" in labels
+    assert "Reject c-01" in labels
+    assert "Approve c-02" not in labels
+    assert "Reject c-02" not in labels
+    assert any("Human decision requires VERIFIED status." in text for text in _texts(at))
+
+
+def test_approve_flow_updates_decision_without_rerun(monkeypatch):
+    at, calls, _ = _run_with_fake(monkeypatch)
+    assert at.session_state["report"].human_decision == {
+        "c-01": "PENDING",
+        "c-02": "PENDING",
+    }
+    _click_button(at, "Approve c-01")
+    assert at.session_state["report"].human_decision == {
+        "c-01": "APPROVED",
+        "c-02": "PENDING",
+    }
+    assert len(calls) == 1, "approving must not rerun the pipeline"
+
+
+def test_reject_flow_updates_decision(monkeypatch):
+    at, calls, _ = _run_with_fake(monkeypatch)
+    _click_button(at, "Reject c-01")
+    assert at.session_state["report"].human_decision == {
+        "c-01": "REJECTED",
+        "c-02": "PENDING",
+    }
+    assert len(calls) == 1, "rejecting must not rerun the pipeline"
+
+
+def test_candidate_diff_text_exact():
+    application = ApplicationResult(
+        candidate_id="c-01",
+        applied=True,
+        changed_files=("configs/r1.cfg",),
+        diff=(
+            FileDiff(
+                file="configs/r1.cfg",
+                removed=("ip route 10.9.9.0 255.255.255.0 192.0.2.1",),
+                added=(
+                    "ip route 10.9.9.0 255.255.255.0 192.0.2.2",
+                    "ip route 10.9.9.0 255.255.255.0 192.0.2.3",
+                ),
+            ),
+        ),
+        reasons=(),
+    )
+    assert app.candidate_diff_text(application) == (
+        "configs/r1.cfg\n"
+        "- ip route 10.9.9.0 255.255.255.0 192.0.2.1\n"
+        "+ ip route 10.9.9.0 255.255.255.0 192.0.2.2\n"
+        "+ ip route 10.9.9.0 255.255.255.0 192.0.2.3\n"
+    )
+
+
+def test_download_button_only_for_verified_candidate():
+    at = AppTest.from_file(APP_PATH)
+    at.session_state["report"] = _full_report()
+    at.run()
+    assert at.exception == [], [str(e) for e in at.exception]
+    labels = [button.label for button in at.download_button]
+    assert "Download diff c-01" in labels
+    assert "Download diff c-02" not in labels
 
 
 def test_run_progress_events_do_not_break_run(monkeypatch):
