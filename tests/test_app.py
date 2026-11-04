@@ -36,6 +36,7 @@ from netops_lens.models import (
 )
 from netops_lens.pipeline import REPO_ROOT
 from streamlit.testing.v1 import AppTest
+from tests._fakes import differential_row, flow_dict, trace_row
 
 APP_PATH = str(REPO_ROOT / "app.py")
 
@@ -191,6 +192,70 @@ def test_run_button_drives_pipeline_and_renders_verdict(monkeypatch):
     assert callable(kwargs.get("on_warning"))
     assert "Verdict: REGRESSION_DETECTED" in [e.value for e in at.error]
     assert at.session_state["report"] is canned
+
+
+def _run_with_failing_pipeline(monkeypatch, error):
+    import netops_lens.pipeline as pipeline_module
+
+    def _boom(request, **kwargs):
+        raise error
+
+    monkeypatch.setattr(pipeline_module, "run_assessment_pipeline", _boom)
+    at = AppTest.from_file(APP_PATH)
+    at.session_state["report"] = _canned_report()
+    at.run()
+    at.sidebar.button[0].click().run()
+    assert at.exception == [], [str(e) for e in at.exception]
+    return at
+
+
+def test_run_batfish_unavailable_shows_error_and_clears_report(monkeypatch):
+    from netops_lens.pipeline import PipelineConnectionError
+
+    at = _run_with_failing_pipeline(
+        monkeypatch, PipelineConnectionError("set_network blew up halfway")
+    )
+    assert any("Batfish unavailable" in e.value for e in at.error)
+    assert not any("Verdict:" in text for text in _texts(at))
+    assert "report" not in at.session_state
+
+
+def test_run_snapshot_error_shows_error_and_clears_report(monkeypatch):
+    from netops_lens.batfish_client import BatfishError
+
+    at = _run_with_failing_pipeline(monkeypatch, BatfishError("init failed"))
+    assert any("snapshot error" in e.value for e in at.error)
+    assert not any("Verdict:" in text for text in _texts(at))
+    assert "report" not in at.session_state
+
+
+def test_run_assessment_error_shows_error_and_clears_report(monkeypatch):
+    from netops_lens.report import ReportError
+
+    at = _run_with_failing_pipeline(monkeypatch, ReportError("bad report"))
+    assert any("assessment error" in e.value for e in at.error)
+    assert not any("Verdict:" in text for text in _texts(at))
+    assert "report" not in at.session_state
+
+
+def test_render_empty_intent_keeps_scoping_qualification():
+    at = AppTest.from_file(APP_PATH)
+    at.session_state["report"] = Report(
+        assessment=AssessmentResult(
+            verdict="NO_REGRESSION_DETECTED",
+            flow_comparisons=(),
+            findings=(),
+            inconclusive_reasons=(),
+            health=(),
+        ),
+        human_decision={},
+    )
+    at.run()
+    assert at.exception == [], [str(e) for e in at.exception]
+    texts = _texts(at)
+    assert "Verdict: NO_REGRESSION_DETECTED" in [s.value for s in at.success]
+    assert any("(no declared flows)" in text for text in texts)
+    assert any("untested traffic" in text for text in texts)
 
 
 def test_run_failure_shows_error_and_clears_report(monkeypatch):
@@ -556,6 +621,176 @@ def test_download_button_only_for_verified_candidate():
     labels = [button.label for button in at.download_button]
     assert "Download diff c-01" in labels
     assert "Download diff c-02" not in labels
+
+
+def _real_pipeline_wrapper(monkeypatch, answers, candidates):
+    """Patch the pipeline seam with a wrapper around the REAL pipeline.
+
+    The wrapper injects a fake Batfish client and a canned Stage B while
+    passing through the app's on_progress/on_warning kwargs, so the run
+    exercises production Stage A, patching, Stage C, cleanup, and
+    reporting with zero Batfish or Muse contact.
+    """
+    import netops_lens.pipeline as pipeline_module
+    from netops_lens.models import InvestigationResult
+    from tests.test_pipeline import PipeFake
+
+    real_pipeline = pipeline_module.run_assessment_pipeline
+    calls: list = []
+
+    def _canned_stage_b(*args, **kwargs):
+        return InvestigationResult(
+            narrative="test investigation",
+            candidates=candidates,
+            tool_activity=[],
+        )
+
+    def _wrapper(request, **kwargs):
+        calls.append(request)
+        assert callable(kwargs.get("on_progress"))
+        assert callable(kwargs.get("on_warning"))
+        return real_pipeline(
+            request,
+            client_factory=lambda host, network: PipeFake(answers=answers),
+            stage_b=_canned_stage_b,
+            on_progress=kwargs.get("on_progress"),
+            on_warning=kwargs.get("on_warning"),
+        )
+
+    monkeypatch.setattr(pipeline_module, "run_assessment_pipeline", _wrapper)
+    return calls
+
+
+def _run_scenario(at: AppTest, scenario: str):
+    at.run()
+    assert at.exception == [], [str(e) for e in at.exception]
+    at.sidebar.selectbox[0].set_value(scenario).run()
+    at.sidebar.button[0].click().run()
+    assert at.exception == [], [str(e) for e in at.exception]
+
+
+def test_scenario_healthy_renders_no_regression(monkeypatch):
+    from tests.test_pipeline import PipeFake  # noqa: F401 (used via wrapper)
+
+    answers = {
+        ("traceroute", "healthy-baseline"): [trace_row("ACCEPTED")],
+        ("traceroute", "healthy-proposed"): [trace_row("ACCEPTED")],
+    }
+    calls = _real_pipeline_wrapper(monkeypatch, answers, [])
+    at = AppTest.from_file(APP_PATH)
+    _run_scenario(at, "healthy")
+    assert len(calls) == 1 and calls[0].scenario == "healthy"
+    assert "Verdict: NO_REGRESSION_DETECTED" in [s.value for s in at.success]
+    texts = _texts(at)
+    assert any("untested traffic" in text for text in texts)
+    assert any("No candidates were proposed." in text for text in texts)
+    labels = [button.label for button in at.button] + [
+        button.label for button in at.download_button
+    ]
+    assert not any(
+        word in label for label in labels for word in ("Approve", "Reject", "Download")
+    )
+    report = at.session_state["report"]
+    assert report.assessment.verdict == "NO_REGRESSION_DETECTED"
+
+
+def test_scenario_removed_route_renders_verified_repair(monkeypatch):
+    from tests.test_pipeline import PipeFake  # noqa: F401 (used via wrapper)
+    from tests.test_pipeline import _cand_name, _route_candidate, _stage_a_answers
+
+    tag = "removed_route"
+    answers = dict(_stage_a_answers(tag))
+    snap = _cand_name(tag, "c-01")
+    answers[("traceroute", snap)] = [trace_row("ACCEPTED")]
+    answers[("differentialReachability", snap)] = [
+        differential_row("ACCEPTED", "ACCEPTED")
+    ]
+    calls = _real_pipeline_wrapper(monkeypatch, answers, [_route_candidate()])
+    at = AppTest.from_file(APP_PATH)
+    _run_scenario(at, tag)
+    assert len(calls) == 1 and calls[0].scenario == tag
+    assert "Verdict: REGRESSION_DETECTED" in [e.value for e in at.error]
+    assert "Verification: VERIFIED" in [s.value for s in at.success]
+    assert "Approve c-01" in [button.label for button in at.button]
+    assert "Download diff c-01" in [button.label for button in at.download_button]
+    report = at.session_state["report"]
+    assert report.assessment.verdict == "REGRESSION_DETECTED"
+    assert report.verifications[0].status == "VERIFIED"
+
+
+def test_scenario_acl_blocks_db_renders_verified_repair(monkeypatch):
+    from tests.test_pipeline import PipeFake  # noqa: F401 (used via wrapper)
+    from tests.test_pipeline import _cand_name
+
+    tag = "acl_blocks_db"
+    flow_1433 = flow_dict(proto="TCP", dport=1433)
+    flow_22 = flow_dict(proto="TCP", dport=22)
+    answers = {
+        ("traceroute", f"{tag}-baseline"): [
+            trace_row("ACCEPTED", flow=flow_1433),
+            trace_row("DENIED_IN", flow=flow_22),
+        ],
+        ("traceroute", f"{tag}-proposed"): [
+            trace_row("DENIED_IN", flow=flow_1433),
+            trace_row("DENIED_IN", flow=flow_22),
+        ],
+        ("differentialReachability", f"{tag}-proposed"): [
+            differential_row("DENIED_IN", "ACCEPTED", flow=flow_1433),
+            differential_row("DENIED_IN", "DENIED_IN", flow=flow_22),
+        ],
+    }
+    snap = _cand_name(tag, "c-01")
+    answers[("traceroute", snap)] = [
+        trace_row("ACCEPTED", flow=flow_1433),
+        trace_row("DENIED_IN", flow=flow_22),
+    ]
+    answers[("differentialReachability", snap)] = [
+        differential_row("ACCEPTED", "ACCEPTED", flow=flow_1433),
+        differential_row("DENIED_IN", "DENIED_IN", flow=flow_22),
+    ]
+    candidate = CandidatePatch(
+        candidate_id="c-01",
+        rationale="restore the authorized DB port",
+        operations=[
+            {
+                "op": "remove_acl_line",
+                "node": "r1",
+                "acl": "DB-FILTER",
+                "sequence_number": 10,
+                "expected_rule": {
+                    "action": "deny",
+                    "src": "192.0.2.0/24",
+                    "dst": "198.51.100.0/24",
+                    "protocol": "tcp",
+                    "dst_port": 1433,
+                },
+            },
+            {
+                "op": "acl_permit",
+                "node": "r1",
+                "acl": "DB-FILTER",
+                "sequence_number": 10,
+                "src": "192.0.2.0/24",
+                "dst": "198.51.100.0/24",
+                "protocol": "tcp",
+                "dst_port": 1433,
+            },
+        ],
+        target_flow_ids=["app-to-db-authorized"],
+    )
+    calls = _real_pipeline_wrapper(monkeypatch, answers, [candidate])
+    at = AppTest.from_file(APP_PATH)
+    _run_scenario(at, tag)
+    assert len(calls) == 1 and calls[0].scenario == tag
+    assert "Verdict: REGRESSION_DETECTED" in [e.value for e in at.error]
+    assert "Verification: VERIFIED" in [s.value for s in at.success]
+    cells = _frame_cells([df.value for df in at.dataframe])
+    assert any("REGRESSION" in cell for cell in cells)
+    assert any("NO_CHANGE_OK" in cell for cell in cells)
+    assert "Approve c-01" in [button.label for button in at.button]
+    report = at.session_state["report"]
+    assert report.assessment.verdict == "REGRESSION_DETECTED"
+    assert report.verifications[0].status == "VERIFIED"
 
 
 def test_run_progress_events_do_not_break_run(monkeypatch):

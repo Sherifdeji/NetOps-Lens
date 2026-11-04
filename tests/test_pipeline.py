@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from netops_lens import cli
+from netops_lens.agent import AgentError
 from netops_lens.batfish_client import BatfishError
 from netops_lens.intent import IntentError
 from netops_lens.models import (
@@ -385,6 +386,112 @@ def test_cleanup_warnings_forwarded_not_printed(tmp_path, capsys):
         name="silent",
     )
     assert report2.verifications[0].status == "VERIFIED"
+    assert capsys.readouterr().err == ""
+
+
+def test_pipeline_snapshot_init_failure_raises_and_cleans_up(tmp_path):
+    seen: list[PipeFake] = []
+
+    def factory(host, network):
+        fake = PipeFake(
+            answers=_stage_a_answers("manual"),
+            network=network,
+            init_fail={"manual-baseline"},
+        )
+        seen.append(fake)
+        return fake
+
+    base, prop, intent = _write_tree(tmp_path / "case")
+    with pytest.raises(BatfishError, match="fake init failure on manual-baseline"):
+        run_assessment_pipeline(
+            _request(base, prop, intent),
+            settings=_settings(),
+            stage_b=_canned([]),
+            client_factory=factory,
+        )
+    assert len(seen) == 1
+    assert seen[0].networks_deleted == [seen[0].network]
+    assert seen[0].network.startswith("netops-lens-lab-manual-")
+
+
+def test_pipeline_transport_failure_keeps_stage_a_verdict(tmp_path):
+    def _boom(messages, tools):
+        raise AgentError("transport_error: boom")
+
+    fake = PipeFake(answers=_stage_a_answers("manual"))
+    base, prop, intent = _write_tree(tmp_path / "case")
+    report = run_assessment_pipeline(
+        _request(base, prop, intent),
+        settings=_settings(),
+        transport=_boom,
+        client_factory=lambda host, network: fake,
+    )
+    assert report.assessment.verdict == "REGRESSION_DETECTED"
+    assert report.investigation is not None
+    assert "Stage B failed" in report.investigation.narrative
+    assert "transport_error: boom" in report.investigation.narrative
+    assert report.investigation.candidates == []
+    assert report.applications == [] and report.verifications == []
+    assert report.human_decision == {}
+
+
+def test_pipeline_no_api_key_skips_investigation_without_error(tmp_path):
+    settings = _settings()
+    assert settings.meta_api_key is None
+    fake = PipeFake(answers=_stage_a_answers("manual"))
+    base, prop, intent = _write_tree(tmp_path / "case")
+    report = run_assessment_pipeline(
+        _request(base, prop, intent),
+        settings=settings,
+        client_factory=lambda host, network: fake,
+    )
+    assert report.assessment.verdict == "REGRESSION_DETECTED"
+    assert report.investigation is not None
+    assert (
+        report.investigation.narrative
+        == "Stage B skipped: META_API_KEY is not configured."
+    )
+    assert report.investigation.candidates == []
+    assert report.investigation.tool_activity == []
+    assert report.applications == [] and report.verifications == []
+
+
+def test_pipeline_mixed_scenario_and_manual_inputs_rejected_before_batfish(tmp_path):
+    constructed: list = []
+    base, prop, _ = _write_tree(tmp_path / "case")
+    with pytest.raises(IntentError, match="cannot be combined"):
+        run_assessment_pipeline(
+            AssessmentRequest(scenario="healthy", baseline=str(base), proposed=str(prop)),
+            settings=_settings(),
+            client_factory=lambda host, network: constructed.append((host, network)),
+        )
+    assert constructed == [], "input validation must precede any Batfish call"
+
+
+def test_pipeline_empty_intent_reports_no_regression_without_flows(tmp_path, capsys):
+    base = tmp_path / "case" / "base"
+    prop = tmp_path / "case" / "proposed"
+    base.mkdir(parents=True)
+    prop.mkdir(parents=True)
+    intent = tmp_path / "case" / "intent.yaml"
+    intent.write_text("version: 1\nmust_reach: []\nmust_not_reach: []\n")
+    answers = {
+        ("traceroute", "manual-baseline"): [trace_row("ACCEPTED")],
+        ("traceroute", "manual-proposed"): [trace_row("ACCEPTED")],
+    }
+    report = run_assessment_pipeline(
+        _request(base, prop, intent),
+        settings=_settings(),
+        stage_b=_canned([]),
+        client_factory=lambda host, network: PipeFake(answers=answers),
+    )
+    assert report.assessment.verdict == "NO_REGRESSION_DETECTED"
+    assert list(report.assessment.flow_comparisons) == []
+    assert all(
+        finding.claim_type.value == "SNAPSHOT_HEALTH" for finding in report.assessment.findings
+    )
+    assert report.applications == [] and report.verifications == []
+    assert report.human_decision == {}
     assert capsys.readouterr().err == ""
 
 

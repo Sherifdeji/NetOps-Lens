@@ -79,6 +79,16 @@ def test_invalid_numeric_values_fail(clean_env, monkeypatch):
         load_settings()
 
 
+def test_invalid_numeric_sibling_values_fail(clean_env, monkeypatch):
+    monkeypatch.setenv("MAX_CANDIDATES", "many")
+    with pytest.raises(RuntimeError, match="invalid_config"):
+        load_settings()
+    monkeypatch.delenv("MAX_CANDIDATES")
+    monkeypatch.setenv("MAX_PATCH_RETRIES", "many")
+    with pytest.raises(RuntimeError, match="invalid_config"):
+        load_settings()
+
+
 def test_api_key_optional_and_never_exposed(clean_env, monkeypatch):
     assert load_settings().meta_api_key is None
     monkeypatch.setenv("META_API_KEY", "   ")
